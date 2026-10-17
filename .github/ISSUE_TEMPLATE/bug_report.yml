@@ -1,0 +1,29 @@
+name: Bug report
+description: omaforecast did something wrong or got a forecast wrong
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: Paste the output of the command. For a wrong forecast, also attach ~/.local/state/omaforecast/last-forecast.diff and any logs in ~/.local/state/omaforecast/sim-logs/.
+      render: text
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Output of `omaforecast version`, `omarchy-version`, and `bwrap --version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: channel
+    attributes:
+      label: Omarchy channel
+      options: [stable, rc, edge, dev, not sure]

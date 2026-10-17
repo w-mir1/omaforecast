@@ -1,0 +1,16 @@
+name: Feature request
+description: Suggest a change or a new check
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What went wrong for you, or what you couldn't find out before or after an update.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Proposal
+      description: What you'd like omaforecast to do. Example commands or output help.

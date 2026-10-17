@@ -1,0 +1,153 @@
+fixtures in /data/omaforecast/.work/e2e/fixtures
+
+### Install tools
+
+### Build fake Omarchy packages v1 (4.0.3) and v2 (4.0.4) from real Omarchy source
+PASS: installed omarchy 4.0.3
+
+### Create user (gets Omarchy's /etc/skel) and customize their config
+
+### omaforecast setup (hook + menu + pacman hook)
+✓ post-update hook: ~/.config/omarchy/hooks/post-update.d/50-omaforecast
+✓ menu: Update › Forecast and Update › Config Rollback
+Installing the pacman hook (needs sudo) so every update snapshots your config first,
+even when started from the bar icon or plain 'omarchy update'.
+✓ pacman hook: /etc/pacman.d/hooks/90-omaforecast-snapshot.hook
+PASS: setup ran
+PASS: post-update hook installed
+PASS: pacman hook installed
+PASS: menu JSONC still parses the way Omarchy parses it
+
+### Publish v2 to the repo (the update is now available)
+
+### Package signatures
+PASS: bad signature stops the forecast before any migration runs
+PASS: --allow-unsigned overrides it
+gpg: WARNING: unsafe permissions on homedir '/tmp/gnupg-test'
+PASS: good signature verified
+PASS: signature from an untrusted key stops the forecast
+gpg: WARNING: unsafe permissions on homedir '/tmp/gnupg-test'
+PASS: signature from a revoked key stops the forecast
+PASS: unsigned package stops the forecast when pacman.conf requires signatures
+
+### omaforecast check (the forecast)
+
+omaforecast: what will the next Omarchy update do to your config?
+Looking for the incoming release…
+Incoming: omarchy 4.0.3-1 → 4.0.4-1 (signature not checked: no signature published; pacman.conf doesn't require one for [omarchy])
+Pending migrations: 6 (they run as you, right after the packages install)
+
+ ✗ 1788745941  Update Kitty configuration
+     would modify ~/.config/kitty/kitty.conf [you customized this]
+     keeps a backup at ~/.config/kitty/kitty.conf.bak.UdIxrG
+
+ ✗ 1791968925  Write the bar's tray where the bar drew it
+     would modify ~/.config/omarchy/shell.json [you customized this]
+
+ ✗ 1791969355  Split the bar's center section at its anchor into centerBegin, center and centerEnd
+     would modify ~/.config/omarchy/shell.json [you customized this]
+
+ ✗ 1792020559  Theme the Fcitx candidate window with the current Omarchy theme
+     would create ~/.config/fcitx5/conf/classicui.conf [new file]
+     also wants to run:
+       busctl --user --auto-start=no call org.fcitx.Fcitx5 /controller org.fcitx.Fcitx.Controlle
+
+ ✓ 1792041364  Install Gliff on aarch64, now that Omarchy's repositories build it there
+     no changes to your config
+
+ ✓ 1792202836  Let mpv and Chromium decode video on the video chip of Snapdragon laptops
+     no changes to your config
+
+Package files you edited by hand
+ The update replaces these with the new package's copy (files in /etc get a .pacnew instead):
+   /usr/share/omarchy/default/hypr/bindings/tiling.lua
+ Move those edits into ~/.config, where Omarchy expects overrides.
+
+New Omarchy defaults you won't get automatically
+ Upstream changed these, but you've customized your copy, so the update leaves yours alone:
+   ~/.config/omarchy/shell.json
+ What changed upstream is in the full diff.
+
+Summary
+ 2 file(s) you changed would be rewritten. Also: 0 stock, 1 new.
+ Full diff: omaforecast check --diff  (saved to ~/.local/state/omaforecast/last-forecast.diff)
+ Snapshot saved: 20261017-153419-pre-update
+ After the update, undo it with: omaforecast restore  (or one file: omaforecast restore <path>)
+PASS: found incoming release from the repo
+PASS: 6 pending migrations
+PASS: warns: kitty.conf (customized) will change
+PASS: warns: shell.json (customized) will change
+PASS: bindings.lua not flagged
+PASS: reports hand-edited package file
+PASS: pre-update snapshot taken
+PASS: forecast changed nothing on disk
+PASS: system packages untouched by forecast
+PASS: state, snapshots, diffs and logs are private
+
+### Hostile migration file name (sandboxed dry run)
+PASS: migration name can't run commands on the host
+
+### A migration can't pull private files into the sandbox
+PASS: private keys, excluded files and files outside home never reach the sandbox
+
+### Static fallback without bubblewrap
+PASS: static mode names kitty.conf
+PASS: notes the .bak the kitty migration writes
+PASS: summary counts 2 distinct customized files
+
+### Run the real update: pacman -Syu + omarchy-migrate + post-update hook
+(1/1) omaforecast: snapshotting Omarchy user config before the upgrade...
+upgrading omarchy...
+PASS: pacman hook ran before the upgrade
+omarchy-migrate exit: 0
+
+omaforecast: what the update changed in your config (since 20261017-153423-pre-update)
+  added     ~/.config/fcitx5/conf/classicui.conf
+  modified  ~/.config/kitty/kitty.conf
+  modified  ~/.config/omarchy/shell.json
+
+ See the diff:   omaforecast diff 20261017-153423-pre-update
+ Undo all:       omaforecast restore 20261017-153423-pre-update
+ Undo one file:  omaforecast restore 20261017-153423-pre-update ~/<path>
+predicted:
+~/.config/fcitx5/conf/classicui.conf
+~/.config/kitty/kitty.conf
+~/.config/omarchy/shell.json
+actual:
+~/.config/fcitx5/conf/classicui.conf
+~/.config/kitty/kitty.conf
+~/.config/omarchy/shell.json
+PASS: forecast matched what the update actually changed
+PASS: update did rewrite kitty.conf (as forecast)
+
+### omaforecast restore (one command rollback)
+
+Restore from snapshot 20261017-153423-pre-update (pre-update, 2026-10-17T15:34:23+00:00)
+  remove     ~/.config/fcitx5/conf/classicui.conf
+  put back   ~/.config/kitty/kitty.conf
+  keep       ~/.config/nvim/lua/new-plugin.lua (inside the symlinked ~/.config/nvim; omaforecast never deletes through a symlink)
+  put back   ~/.config/omarchy/shell.json
+
+Restored 3 file(s). Undo with: omaforecast restore 20261017-153426-pre-restore
+Restart the Omarchy shell to pick up shell.json changes: omarchy-restart-shell
+PASS: restore --delete never deletes through the stowed nvim link
+PASS: and says why it kept it
+PASS: config is byte-identical to before the update
+PASS: kitty setting back
+
+### Undo the restore
+PASS: restore is undoable
+
+### Single-file restore
+PASS: single file restored
+PASS: only that file changed back
+
+### Uninstall
+removed post-update hook
+removed menu entries
+removed pacman hook
+removed snapshots and cache
+removed ~/.local/bin/omaforecast
+PASS: uninstall clean, user menu entries kept
+
+RESULT: 37 passed, 0 failed

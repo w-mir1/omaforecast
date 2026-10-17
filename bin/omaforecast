@@ -1,0 +1,1492 @@
+#!/bin/bash
+#
+# omaforecast: see what the next `omarchy update` will do to your config
+# before it runs, snapshot your config, and roll it back with one command.
+#
+# https://github.com/w-mir1/omaforecast  (MIT)
+# shellcheck disable=SC2088  # "~/" is display text, never expanded
+
+set -uo pipefail
+# Snapshots, diffs and logs can hold secrets from your config: keep them private.
+umask 077
+
+VERSION=0.1.0
+PROG=omaforecast
+
+OMARCHY_PATH=${OMARCHY_PATH:-/usr/share/omarchy}
+OF_STATE=${OMAFORECAST_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/omaforecast}
+OF_CACHE=${OMAFORECAST_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/omaforecast}
+OF_CONF=${OMAFORECAST_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/omaforecast}
+SNAPDIR=$OF_STATE/snapshots
+KEEP=${OMAFORECAST_KEEP:-30}
+MIG_STATE=${OMARCHY_MIGRATION_STATE:-$HOME/.local/state/omarchy/migrations}
+SIM_TIMEOUT=${OMAFORECAST_SIM_TIMEOUT:-90}
+
+# ---------------------------------------------------------------- output ----
+
+if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+  B=$'\e[1m' D=$'\e[2m' R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' C=$'\e[36m' N=$'\e[0m'
+else
+  B='' D='' R='' G='' Y='' C='' N=''
+fi
+QUIET=0
+say() { ((QUIET)) || printf '%s\n' "$*"; }
+hdr() { ((QUIET)) || printf '\n%s%s%s\n' "$B" "$*" "$N"; }
+warn() { printf '%s%s:%s %s\n' "$Y" "$PROG" "$N" "$*" >&2; }
+die() { printf '%s%s:%s %s\n' "$R" "$PROG" "$N" "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+tilde() { local p=$1; [[ $p == "$HOME"/* ]] && p="~/${p#"$HOME"/}"; printf '%s' "$p"; }
+
+same_file() { # same content? (missing == missing)
+  [[ -e $1 || -e $2 ]] || return 0
+  [[ -f $1 && -f $2 ]] || return 1
+  if have cmp; then cmp -s -- "$1" "$2"; else
+    [[ $(sha256sum <"$1") == "$(sha256sum <"$2")" ]]; fi
+}
+
+confirm() { # confirm "question"  (assumes yes with --yes)
+  ((ASSUME_YES)) && return 0
+  [[ -t 0 ]] || { warn "not a terminal; pass --yes to continue"; return 1; }
+  if have gum; then gum confirm "$1"; else
+    local a; read -r -p "$1 [y/N] " a; [[ $a == [yY]* ]]; fi
+}
+ASSUME_YES=0
+TMPS=()
+cleanup() { ((${#TMPS[@]})) && rm -rf "${TMPS[@]}"; return 0; }
+trap cleanup EXIT
+
+show_diff() { # show_diff old new label
+  local old=$1 new=$2 label=$3
+  [[ -L $old ]] && { printf '%s== %s%s\n  (symlink -> %s)\n' "$B" "$label" "$N" "$(readlink "$old")"; return 0; }
+  [[ -L $new ]] && { printf '%s== %s%s\n  (now a symlink -> %s)\n' "$B" "$label" "$N" "$(readlink "$new")"; return 0; }
+  [[ -e $old ]] || old=/dev/null
+  [[ -e $new ]] || new=/dev/null
+  printf '%s== %s%s\n' "$B" "$label" "$N"
+  if have diff; then
+    diff -u --label "a/$label" --label "b/$label" -- "$old" "$new" | colorize_diff
+  elif have git; then
+    git --no-pager diff --no-index -- "$old" "$new" | tail -n +3 | colorize_diff
+  else
+    echo "(install diffutils or git to see diffs)"
+  fi
+  return 0
+}
+
+colorize_diff() {
+  local line
+  while IFS= read -r line; do
+    case $line in
+      +++* | ---*) printf '%s%s%s\n' "$B" "$line" "$N" ;;
+      +*) printf '%s%s%s\n' "$G" "$line" "$N" ;;
+      -*) printf '%s%s%s\n' "$R" "$line" "$N" ;;
+      @@*) printf '%s%s%s\n' "$C" "$line" "$N" ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done
+}
+
+# ----------------------------------------------------------------- scope ----
+# Which files count as "your Omarchy config". Everything Omarchy ships into
+# ~/.config (the tree under $OMARCHY_PATH/config), plus the files Omarchy
+# migrations are known to edit, plus anything you list in
+# ~/.config/omaforecast/include. ~/.config/omaforecast/exclude takes globs.
+
+DEFAULT_SCOPE=(
+  .config/hypr .config/omarchy .config/foot .config/kitty .config/alacritty
+  .config/ghostty .config/tmux .config/btop .config/fcitx5 .config/wireplumber
+  .config/xdg-desktop-portal .config/starship.toml .config/hyprland-mimeapps.list
+  .config/mimeapps.list .config/chromium-flags.conf .config/brave-flags.conf
+  .config/brave-origin-flags.conf .config/systemd/user .config/nvim .config/helix
+  .config/mise/config.toml .config/imv .config/lazygit .config/git .config/herdr
+  .config/opencode .config/hyprland-preview-share-picker .config/uwsm
+  .config/environment.d .config/autostart .config/fastfetch .config/mpv
+  .local/share/applications .local/state/omarchy/toggles
+  .bashrc .bash_profile .XCompose
+)
+# Never worth snapshotting: browser profiles, git internals, plugin checkouts,
+# generated theme state, and the backups Omarchy itself writes.
+DEFAULT_EXCLUDE=(
+  '.config/chromium/*' '*/.git/*' '.config/omarchy/plugins/*'
+  '.config/omarchy/current/*' '*/node_modules/*' '*.bak.*' '*/lazy-lock.json'
+)
+
+scope_entries() {
+  local e
+  printf '%s\n' "${DEFAULT_SCOPE[@]}" || return 1
+  if [[ -d $OMARCHY_PATH/config ]]; then
+    for e in "$OMARCHY_PATH"/config/* "$OMARCHY_PATH"/config/.[!.]*; do
+      [[ -e $e ]] || continue
+      [[ ${e##*/} == chromium ]] && continue
+      printf '.config/%s\n' "${e##*/}" || return 1
+    done
+  fi
+  if [[ -e $OF_CONF/include || -L $OF_CONF/include ]]; then
+    sed -e 's/[[:space:]]*#.*//' -e '/^[[:space:]]*$/d' -e "s#^~/##" -e "s#^$HOME/##" "$OF_CONF/include" || return 1
+  fi
+  return 0
+}
+
+excluded() {
+  local f=$1 pat
+  for pat in "${DEFAULT_EXCLUDE[@]}" "${USER_EXCLUDE[@]}"; do
+    # shellcheck disable=SC2053
+    [[ $f == $pat ]] && return 0
+  done
+  return 1
+}
+USER_EXCLUDE=()
+# Tell "no exclude list" apart from "can't see whether there is one", such as
+# when ~/.config/omaforecast itself can't be searched.
+if ! _ex=$(LC_ALL=C stat -c %n -- "$OF_CONF/exclude" 2>&1 >/dev/null) &&
+  [[ $_ex != *"No such file or directory"* && $_ex != *"Not a directory"* ]]; then
+  printf '%s: %s\n' "$PROG" "can't check ${OF_CONF/#$HOME/\~}/exclude; fix the folder's permissions" >&2; exit 1
+fi
+if [[ -e $OF_CONF/exclude || -L $OF_CONF/exclude ]]; then
+  # An exclude list that can't be read must stop everything: the files it
+  # names would otherwise be snapshotted and shown to migrations.
+  _ex=$(sed -e 's/[[:space:]]*#.*//' -e '/^[[:space:]]*$/d' -e "s#^~/##" "$OF_CONF/exclude") ||
+    { printf '%s: %s\n' "$PROG" "can't read ${OF_CONF/#$HOME/\~}/exclude; fix its permissions or remove it" >&2; exit 1; }
+  [[ -n $_ex ]] && mapfile -t USER_EXCLUDE <<<"$_ex"
+  unset _ex
+fi
+
+# list_files ROOT: tracked regular files under ROOT (a $HOME or a copy of it),
+# relative paths, one per line. Follows symlinks so stow/chezmoi setups are
+# captured by content.
+list_files() {
+  local root=$1 p f
+  { if [[ -n ${SCOPE_FILE:-} ]]; then cat "$SCOPE_FILE"; else scope_entries; fi; } | sort -u | while IFS= read -r p; do
+    [[ -n $p && -e $root/$p ]] || continue
+    if [[ -d $root/$p ]]; then
+      (cd "$root" && find -L "$p" \( -name .git -o -name node_modules \
+        -o -path .config/omarchy/plugins -o -path .config/omarchy/current \) -prune \
+        -o -type f -size -50M -print 2>/dev/null)
+    else
+      printf '%s\n' "$p"
+    fi
+  done | while IFS= read -r f; do excluded "$f" || printf '%s\n' "$f"; done | sort -u
+}
+
+# copy_tree SRCROOT DSTROOT LISTFILE: copy the listed files (dereferencing
+# symlinks), keeping modes. Fails if anything couldn't be copied.
+copy_tree() {
+  [[ -s $3 ]] || return 0
+  mkdir -p "$2" || return 1
+  (cd "$1" && tar -ch --no-recursion --verbatim-files-from --files-from="$3" -f -) | tar -xp -C "$2" -f -
+  local rc=("${PIPESTATUS[@]}")
+  ((rc[0] == 0 && rc[1] == 0))
+}
+
+# anc_link ROOT REL: true if a directory component of REL below ROOT is a symlink.
+anc_link() {
+  local cur=$1 rest=$2
+  while [[ $rest == */* ]]; do
+    cur=$cur/${rest%%/*}; rest=${rest#*/}
+    [[ -L $cur ]] && return 0
+  done
+  return 1
+}
+
+# traversable ROOT REL: every directory above REL that exists can be
+# searched, so "REL doesn't exist" really means it doesn't.
+traversable() {
+  local cur=$1 rest=$2 t
+  [[ -x $cur ]] || return 1
+  while [[ $rest == */* ]]; do
+    cur=$cur/${rest%%/*}; rest=${rest#*/}
+    if [[ ! -e $cur ]]; then
+      [[ -L $cur ]] || return 0   # really absent, so nothing below it exists
+      # A symlink whose target can't be reached: decide by the target's path.
+      t=$(realpath -m -- "$cur" 2>/dev/null) && [[ -n $t && $t != "$cur" ]] || return 1
+      traversable / "${t#/}/x"; return
+    fi
+    [[ ! -d $cur || -x $cur ]] || return 1
+  done
+  return 0
+}
+
+# known ABS: we can tell whether ABS exists. False when a directory on the
+# way to it, or to a symlink's target, can't be searched.
+known() {
+  local p=$1
+  [[ -L $p && ! -e $p ]] && p=$(realpath -m -- "$p")
+  traversable / "${p#/}"
+}
+
+# under_any REL LISTFILE: REL equals, or is below, a path in LISTFILE.
+under_any() {
+  [[ -s $2 ]] || return 1
+  awk -v f="$1" 'length($0) && (f == $0 || index(f, $0 "/") == 1) {found=1; exit} END {exit !found}' "$2"
+}
+
+# --------------------------------------------------------------- versions ---
+
+omarchy_version() {
+  if have omarchy-version; then omarchy-version 2>/dev/null && return; fi
+  pacman -Q omarchy 2>/dev/null | awk '{print $2}' && return
+  [[ -f $OMARCHY_PATH/version ]] && cat "$OMARCHY_PATH/version" && return
+  echo unknown
+}
+
+# -------------------------------------------------------------- snapshots ---
+
+snap_meta() { sed -n "s/^$2=//p" "$SNAPDIR/$1/meta" 2>/dev/null | head -1; }
+
+snap_ids() { # complete snapshots, oldest → newest
+  [[ -d $SNAPDIR ]] || return 0
+  local id
+  find "$SNAPDIR" -mindepth 1 -maxdepth 1 -type d -name '[!.]*' -printf '%f\n' | sort | while IFS= read -r id; do
+    grep -qx 'complete=1' "$SNAPDIR/$id/meta" 2>/dev/null && printf '%s\n' "$id"
+  done
+}
+
+resolve_snap() { # resolve_snap [ARG] → id
+  local arg=${1:-latest} id
+  case $arg in
+    latest | last) snap_ids | tail -1 ;;
+    pre-update | before-update)
+      for id in $(snap_ids | tac); do
+        [[ $(snap_meta "$id" label) == pre-update ]] && { echo "$id"; return; }
+      done ;;
+    *)
+      if [[ $arg != */* && -d $SNAPDIR/$arg ]] && snap_ids | grep -qxF -- "$arg"; then echo "$arg"; return; fi
+      snap_ids | grep -F -- "$arg" | tail -1 ;;
+  esac
+}
+
+# verify_snap ID: the snapshot finished and every saved file still matches
+# the checksum taken when it was saved.
+verify_snap() {
+  local d=$SNAPDIR/$1
+  grep -qx 'complete=1' "$d/meta" 2>/dev/null || return 1
+  [[ -f $d/manifest && -f $d/sums ]] || return 1
+  [[ -s $d/manifest ]] || return 0
+  (cd "$d/files" && sha256sum --quiet --status -c ../sums) 2>/dev/null
+}
+
+# snap_coverage ROOT DIR: what a snapshot can vouch for, so restore --delete
+# only removes files that provably did not exist when it was taken.
+#   scope   the paths the snapshot looked at
+#   exists  every path that existed under them, of any type and size
+#   blind   paths it couldn't fully list (never treated as absent)
+#   links   symlinks at or under the scope, with their targets
+snap_coverage() {
+  local root=$1 dir=$2 p q rest l err=0
+  [[ -r $dir/scope.raw ]] || return 1
+  {
+    cat "$dir/scope.raw" || exit 1
+    if [[ -n ${OF_EXTRA_FILES:-} && -f $OF_EXTRA_FILES ]]; then cat "$OF_EXTRA_FILES" || exit 1; fi
+  } | sed '/^$/d' | sort -u >"$dir/scope" || return 1
+  : >"$dir/exists" && : >"$dir/blind" && : >"$dir/links.tmp" || return 1
+  # Every write is checked (pipefail is on): a lost record could make
+  # restore --delete think a file never existed.
+  while IFS= read -r p; do
+    known "$root/$p" || { printf '%s\n' "$p" >>"$dir/blind" || err=1; continue; }
+    q="" rest=$p
+    while [[ -n $rest ]]; do
+      q=${q:+$q/}${rest%%/*}; [[ $rest == */* ]] && rest=${rest#*/} || rest=""
+      if [[ -L $root/$q ]]; then
+        printf '%s\t%s\t%s\n' "$q" "$(readlink -- "$root/$q")" "$(realpath -m -- "$root/$q")" >>"$dir/links.tmp" || err=1
+      fi
+    done
+    [[ -e $root/$p || -L $root/$p ]] || continue
+    if [[ -d $root/$p ]]; then
+      if ! (cd "$root" && LC_ALL=C find -L "$p" \( -name .git -o -name node_modules -o -path .config/omarchy/plugins \
+        -o -path .config/omarchy/current \) -prune -o -print 2>"$dir/find.err") >>"$dir/exists"; then
+        # find names each path it couldn't read or list: find: 'PATH': reason
+        { sed -n "s/^find: '\(.*\)': .*/\1/p" "$dir/find.err" | grep . || printf '%s\n' "$p"; } >>"$dir/blind" || err=1
+      fi
+      (cd "$root" && find -L "$p" \( -name .git -o -name node_modules \) -prune -o -xtype l -print 2>/dev/null) |
+        while IFS= read -r l; do printf '%s\t%s\t%s\n' "$l" "$(readlink -- "$root/$l")" "$(realpath -m -- "$root/$l")" || exit 1; done >>"$dir/links.tmp" || err=1
+    else
+      printf '%s\n' "$p" >>"$dir/exists" || err=1
+    fi
+  done <"$dir/scope"
+  ((err == 0)) || return 1
+  sort -u "$dir/links.tmp" >"$dir/links" && rm -f "$dir/links.tmp" "$dir/find.err" "$dir/scope.raw" &&
+    sort -u -o "$dir/blind" "$dir/blind" && sort -u -o "$dir/exists" "$dir/exists"
+}
+
+SNAP_TMP=""
+snap_die() { [[ -n $SNAP_TMP ]] && rm -rf "$SNAP_TMP"; die "$@"; }
+
+cmd_snapshot() {
+  local label=manual
+  while (($#)); do
+    case $1 in
+      -q | --quiet) QUIET=1 ;;
+      --auto) ;;
+      -*) die "snapshot: unknown option $1" ;;
+      *) label=$1 ;;
+    esac
+    shift
+  done
+  label=${label//[^A-Za-z0-9._-]/-}
+  # An unreadable include list would silently shrink the snapshot.
+  known "$OF_CONF/include" || die "can't look inside $(tilde "$OF_CONF") or a folder above it (permissions); not taking a snapshot"
+  [[ ! -e $OF_CONF/include || -r $OF_CONF/include ]] || die "can't read $(tilde "$OF_CONF/include"); not taking a snapshot without the paths it lists"
+
+  mkdir -p "$SNAPDIR" && chmod 700 "$OF_STATE" "$SNAPDIR" || die "can't create $(tilde "$SNAPDIR")"
+  local id dir prev n
+  id="$(date +%Y%m%d-%H%M%S)-$label"
+  while [[ -e $SNAPDIR/$id ]]; do id="$id-1"; done
+  prev=$(snap_ids | tail -1)
+  dir=$(mktemp -d "$SNAPDIR/.tmp.XXXXXX") || die "can't create a snapshot directory"
+  TMPS+=("$dir"); SNAP_TMP=$dir
+  mkdir -p "$dir/files"
+  local fail="could not save snapshot; nothing was published"
+  # Read the scope once, and fail if any part of it (the include list) can't be read.
+  scope_entries >"$dir/scope.raw" || snap_die "$fail (couldn't read $(tilde "$OF_CONF/include"))"
+  SCOPE_FILE=$dir/scope.raw list_files "$HOME" >"$dir/wanted.raw" || snap_die "$fail (couldn't write the file list)"
+  if [[ -n ${OF_EXTRA_FILES:-} && -f $OF_EXTRA_FILES ]]; then
+    cat -- "$OF_EXTRA_FILES" >>"$dir/wanted.raw" || snap_die "$fail (couldn't write the file list)"
+  fi
+  sed '/^$/d' "$dir/wanted.raw" | sort -u >"$dir/wanted" && ((PIPESTATUS[0] == 0)) || snap_die "$fail (couldn't write the file list)"
+  rm -f "$dir/wanted.raw"
+  # Readable regular files are saved. Anything else that exists is recorded as
+  # unreadable, so restore never mistakes it for absent.
+  local f
+  local werr=0
+  while IFS= read -r f; do
+    if [[ -f $HOME/$f && -r $HOME/$f ]]; then printf 'M\t%s\n' "$f" || { werr=1; break; }
+    elif [[ -e $HOME/$f || -L $HOME/$f ]]; then printf 'U\t%s\n' "$f" || { werr=1; break; }; fi
+  done <"$dir/wanted" >"$dir/class"
+  ((werr == 0)) || snap_die "$fail (couldn't write the file list)"
+  awk -F'\t' '$1 == "M" {print $2}' "$dir/class" >"$dir/manifest" &&
+    awk -F'\t' '$1 == "U" {print $2}' "$dir/class" >"$dir/unreadable" &&
+    [[ $(($(wc -l <"$dir/manifest") + $(wc -l <"$dir/unreadable"))) == "$(wc -l <"$dir/class")" ]] ||
+    snap_die "$fail (couldn't write the file list)"
+  rm -f "$dir/wanted" "$dir/class"
+  copy_tree "$HOME" "$dir/files" "$dir/manifest" || snap_die "$fail (copying failed)"
+  while IFS= read -r f; do
+    [[ -f $dir/files/$f && ! -L $dir/files/$f ]] && cmp -s -- "$HOME/$f" "$dir/files/$f" ||
+      snap_die "$fail (~/$f changed while it was being saved, or the copy is incomplete)"
+  done <"$dir/manifest"
+  [[ -s $dir/unreadable ]] && warn "$(wc -l <"$dir/unreadable") file(s) couldn't be read and are not in this snapshot (listed in $(tilde "$SNAPDIR/$id/unreadable"))"
+  snap_coverage "$HOME" "$dir" || snap_die "$fail (couldn't record what was covered)"
+  # A directory that can't be listed would leave files out of the snapshot
+  # without anyone noticing. Fail instead, unless the user excluded it.
+  local b bad=()
+  while IFS= read -r b; do
+    [[ -n $b ]] || continue
+    excluded "$b" || excluded "$b/" || bad+=("~/$b")
+  done <"$dir/blind"
+  ((${#bad[@]} == 0)) || snap_die "$fail (couldn't list ${bad[*]}; fix its permissions or add it to $(tilde "$OF_CONF/exclude"))"
+
+  # Share unchanged files with the previous snapshot (hardlinks): a snapshot
+  # of an unchanged config costs almost nothing.
+  if [[ -n $prev && -d $SNAPDIR/$prev/files ]]; then
+    while IFS= read -r f; do
+      [[ -f $SNAPDIR/$prev/files/$f ]] && same_file "$dir/files/$f" "$SNAPDIR/$prev/files/$f" &&
+        [[ $(stat -c %a -- "$dir/files/$f") == "$(stat -c %a -- "$SNAPDIR/$prev/files/$f")" ]] &&
+        ln -f -- "$SNAPDIR/$prev/files/$f" "$dir/files/$f" 2>/dev/null
+    done <"$dir/manifest"
+  fi
+  : >"$dir/sums"
+  if [[ -s $dir/manifest ]]; then
+    (cd "$dir/files" && tr '\n' '\0' <../manifest | xargs -0 sha256sum --) >"$dir/sums" || snap_die "$fail (checksums)"
+  fi
+
+  n=$(wc -l <"$dir/manifest")
+  {
+    echo "id=$id"
+    echo "label=$label"
+    echo "created=$(date -Is)"
+    echo "omarchy=$(omarchy_version)"
+    echo "files=$n"
+    echo "complete=1"
+  } >"$dir/meta" || snap_die "$fail (metadata)"
+  mv -T -- "$dir" "$SNAPDIR/$id" || snap_die "$fail (publishing)"
+  verify_snap "$id" || { rm -rf "${SNAPDIR:?}/$id"; snap_die "$fail (verification)"; }
+  [[ -n ${OF_NOPRUNE:-} ]] || prune_snapshots
+  if ((QUIET)); then echo "$id"; else
+    say "${G}Snapshot saved:${N} $id ($n files) in $(tilde "$SNAPDIR/$id")"
+  fi
+}
+
+prune_snapshots() {
+  local ids count
+  mapfile -t ids < <(snap_ids)
+  count=${#ids[@]}
+  ((count > KEEP)) || return 0
+  local i
+  for ((i = 0; i < count - KEEP; i++)); do rm -rf "${SNAPDIR:?}/${ids[i]}"; done
+}
+
+cmd_list() {
+  local ids id
+  mapfile -t ids < <(snap_ids)
+  if ((${#ids[@]} == 0)); then
+    say "No snapshots yet. Take one with: $PROG snapshot"
+    return 0
+  fi
+  printf '%s%-34s %-12s %6s  %s%s\n' "$B" SNAPSHOT LABEL FILES OMARCHY "$N"
+  for id in "${ids[@]}"; do
+    printf '%-34s %-12s %6s  %s\n' "$id" "$(snap_meta "$id" label)" "$(snap_meta "$id" files)" "$(snap_meta "$id" omarchy)"
+  done
+}
+
+# changes OLDROOT OLDLIST NEWROOT NEWLIST → "M|A|D<TAB>path" lines
+changes() {
+  sort -u "$2" "$4" | while IFS= read -r f; do
+    [[ -n $f ]] || continue
+    local o=$1/$f n=$3/$f
+    if [[ -f $o && ! -f $n ]]; then printf 'D\t%s\n' "$f"
+    elif [[ ! -f $o && -f $n ]]; then printf 'A\t%s\n' "$f"
+    elif [[ -f $o && -f $n ]] && ! same_file "$o" "$n"; then printf 'M\t%s\n' "$f"
+    fi
+  done
+}
+
+# Like changes, but never follows symlinks, in the last component or any
+# directory above it: the sandbox's home is untrusted, and a link planted
+# there could point at your real files.
+sim_changes() {
+  sort -u "$2" "$4" | while IFS= read -r f; do
+    [[ -n $f ]] || continue
+    local o=$1/$f n=$3/$f
+    local oe=0 ne=0
+    anc_link "$1" "$f" || { [[ -L $o || -f $o ]] && oe=1; }
+    anc_link "$3" "$f" || { [[ -L $n || -f $n ]] && ne=1; }
+    if ((oe && !ne)); then printf 'D\t%s\n' "$f"
+    elif ((!oe && ne)); then printf 'A\t%s\n' "$f"
+    elif ((oe && ne)); then
+      if [[ -L $o || -L $n ]]; then
+        [[ -L $o && -L $n && $(readlink "$o") == "$(readlink "$n")" ]] || printf 'M\t%s\n' "$f"
+      elif ! same_file "$o" "$n"; then printf 'M\t%s\n' "$f"; fi
+    fi
+  done
+}
+
+# now_list ID: files to compare against snapshot ID. The tracked scope, plus
+# anything the snapshot saved that is outside the scope today.
+now_list() {
+  local f
+  {
+    list_files "$HOME"
+    while IFS= read -r f; do [[ -f $HOME/$f ]] && printf '%s\n' "$f"; done <"$SNAPDIR/$1/manifest"
+  } | sort -u
+}
+
+status_word() {
+  case $1 in M) echo "${Y}modified${N}" ;; A) echo "${G}added${N}   " ;; D) echo "${R}deleted${N} " ;; esac
+}
+
+cmd_diff() {
+  local snap="" stat=0 paths=()
+  while (($#)); do
+    case $1 in
+      --stat) stat=1 ;;
+      -*) die "diff: unknown option $1" ;;
+      *) if [[ -z $snap && ! $1 == */* && ! -e $1 ]]; then snap=$1; else paths+=("$1"); fi ;;
+    esac
+    shift
+  done
+  local id; id=$(resolve_snap "${snap:-latest}")
+  [[ -n $id ]] || die "no snapshot found${snap:+ matching '$snap'}"
+  local tmp; tmp=$(mktemp -d); TMPS+=("$tmp")
+  now_list "$id" >"$tmp/now"
+  changes "$SNAPDIR/$id/files" "$SNAPDIR/$id/manifest" "$HOME" "$tmp/now" | filter_paths "${paths[@]}" >"$tmp/ch"
+  if [[ ! -s $tmp/ch ]]; then say "No changes since snapshot $id."; return 0; fi
+  hdr "Changes since snapshot $id ($(snap_meta "$id" created)):"
+  while IFS=$'\t' read -r s f; do printf '  %s  ~/%s\n' "$(status_word "$s")" "$f"; done <"$tmp/ch"
+  ((stat)) && return 0
+  echo
+  while IFS=$'\t' read -r s f; do show_diff "$SNAPDIR/$id/files/$f" "$HOME/$f" "~/$f"; done <"$tmp/ch"
+}
+
+filter_paths() { # keep change lines whose path matches one of the args (or all)
+  if (($# == 0)); then cat; return; fi
+  local line s f p rel
+  while IFS=$'\t' read -r s f; do
+    for p in "$@"; do
+      rel=$p; [[ $rel == "$HOME"/* ]] && rel=${rel#"$HOME"/}; rel=${rel#\~/}
+      [[ $rel == /* ]] && rel=$(realpath -m --relative-to="$HOME" "$rel")
+      rel=${rel%/}
+      if [[ $f == "$rel" || $f == "$rel"/* ]]; then printf '%s\t%s\n' "$s" "$f"; break; fi
+    done
+  done
+}
+
+# same_link ID REL: ~/REL is a symlink now, and was the same symlink in
+# snapshot ID: same link text, and the whole chain resolves to the same place.
+same_link() {
+  local rec
+  rec=$(awk -F'\t' -v p="$2" '$1 == p {print $2 "\t" $3; found=1; exit} END {exit !found}' "$SNAPDIR/$1/links" 2>/dev/null) || return 1
+  [[ $rec == "$(readlink -- "$HOME/$2")"$'\t'"$(realpath -m -- "$HOME/$2")" ]]
+}
+
+# safe_path ID REL write|delete: may restore touch ~/REL? Never through a
+# symlink that wasn't the same symlink when the snapshot was taken. Prints
+# the reason when not.
+safe_path() {
+  local id=$1 rel=$2 mode=$3 q="" rest=$2
+  while [[ $rest == */* ]]; do
+    q=${q:+$q/}${rest%%/*}; rest=${rest#*/}
+    if [[ -L $HOME/$q ]]; then
+      [[ $mode == delete ]] && { echo "inside the symlinked ~/$q; omaforecast never deletes through a symlink"; return 1; }
+      same_link "$id" "$q" || { echo "~/$q is a symlink that's new or points elsewhere since the snapshot"; return 1; }
+    elif [[ -e $HOME/$q && ! -d $HOME/$q ]]; then
+      echo "~/$q is no longer a directory"; return 1
+    fi
+  done
+  if [[ -L $HOME/$rel ]]; then
+    [[ $mode == delete ]] && return 0   # removes the link itself, never its target
+    same_link "$id" "$rel" || { echo "~/$rel is a symlink that's new or points elsewhere since the snapshot"; return 1; }
+    [[ -d $HOME/$rel ]] && { echo "~/$rel now points to a directory"; return 1; }
+  elif [[ -d $HOME/$rel ]]; then
+    echo "~/$rel is now a directory"; return 1
+  fi
+  return 0
+}
+
+# proven_absent ID REL: snapshot ID looked at REL's location and REL wasn't there.
+proven_absent() {
+  local d=$SNAPDIR/$1 rel=$2
+  [[ -f $d/exists && -f $d/scope ]] || return 1
+  under_any "$rel" "$d/scope" || return 1
+  under_any "$rel" "$d/blind" && return 1
+  under_any "$rel" "$d/unreadable" && return 1
+  ! grep -qxF -- "$rel" "$d/exists"
+}
+
+# put_file SRC DEST: replace DEST atomically (a symlink DEST is written
+# through, so stow/chezmoi links stay links).
+put_file() {
+  local src=$1 dest=$2 tmpf
+  [[ -L $dest ]] && dest=$(realpath -m -- "$dest")
+  (umask 022 && mkdir -p -- "$(dirname -- "$dest")") || return 1
+  tmpf=$(mktemp "$(dirname -- "$dest")/.omaforecast.XXXXXX") || return 1
+  if cp --preserve=mode,timestamps -- "$src" "$tmpf" && cmp -s -- "$src" "$tmpf" && mv -f -- "$tmpf" "$dest"; then
+    return 0
+  fi
+  rm -f -- "$tmpf"; return 1
+}
+
+cmd_restore() {
+  local snap="" dry=0 delete=0 paths=()
+  while (($#)); do
+    case $1 in
+      -y | --yes) ASSUME_YES=1 ;;
+      -n | --dry-run) dry=1 ;;
+      --delete) delete=1 ;;
+      -*) die "restore: unknown option $1" ;;
+      *) if [[ -z $snap && ! $1 == */* && ! -e $1 && -n $(resolve_snap "$1") ]]; then snap=$1; else paths+=("$1"); fi ;;
+    esac
+    shift
+  done
+  local id
+  if [[ -n $snap ]]; then id=$(resolve_snap "$snap"); else
+    id=$(resolve_snap pre-update); [[ -n $id ]] || id=$(resolve_snap latest); fi
+  [[ -n $id ]] || die "no snapshot to restore from. Take one with: $PROG snapshot"
+  verify_snap "$id" || die "snapshot $id is incomplete or damaged (checksums don't match); not restoring from it"
+
+  local tmp; tmp=$(mktemp -d); TMPS+=("$tmp")
+  now_list "$id" >"$tmp/now"
+  changes "$SNAPDIR/$id/files" "$SNAPDIR/$id/manifest" "$HOME" "$tmp/now" | filter_paths "${paths[@]}" >"$tmp/ch"
+
+  hdr "Restore from snapshot $id ($(snap_meta "$id" label), $(snap_meta "$id" created))"
+  if [[ ! -s $tmp/ch ]]; then say "Nothing to do: your files already match this snapshot."; return 0; fi
+  # Plan: W = write from the snapshot, X = delete, everything else is reported only.
+  local s f why skipped=0
+  : >"$tmp/act"
+  while IFS=$'\t' read -r s f; do
+    case $s in
+      M | D)
+        if why=$(safe_path "$id" "$f" write); then
+          printf '%s\t%s\n' W "$f" >>"$tmp/act"
+          if [[ $s == M ]]; then printf '  %sput back%s   ~/%s\n' "$Y" "$N" "$f"; else printf '  %srecreate%s   ~/%s\n' "$G" "$N" "$f"; fi
+        else
+          skipped=$((skipped + 1)); printf '  %sskip%s       ~/%s %s(%s)%s\n' "$R" "$N" "$f" "$D" "$why" "$N"
+        fi ;;
+      A)
+        if ((!delete)); then
+          printf '  %skeep%s       ~/%s %s(new since snapshot; --delete removes it)%s\n' "$D" "$N" "$f" "$D" "$N"
+        elif ! proven_absent "$id" "$f"; then
+          printf '  %skeep%s       ~/%s %s(the snapshot never looked at it, so it may not be new)%s\n' "$D" "$N" "$f" "$D" "$N"
+        elif ! why=$(safe_path "$id" "$f" delete); then
+          printf '  %skeep%s       ~/%s %s(%s)%s\n' "$D" "$N" "$f" "$D" "$why" "$N"
+        else
+          printf '%s\t%s\n' X "$f" >>"$tmp/act"
+          printf '  %sremove%s     ~/%s\n' "$R" "$N" "$f"
+        fi ;;
+    esac
+  done <"$tmp/ch"
+  ((dry)) && { say "${D}(dry run, nothing changed)${N}"; return 0; }
+  if [[ ! -s $tmp/act ]]; then ((skipped)) && { warn "$skipped file(s) skipped (see above)"; return 1; }; return 0; fi
+  echo
+  confirm "Restore $(wc -l <"$tmp/act") file(s)?" || { say "Cancelled."; return 1; }
+
+  # The undo snapshot must hold the current copy of every file about to change.
+  cut -f2- "$tmp/act" >"$tmp/touch"
+  local undo; undo=$(OF_EXTRA_FILES=$tmp/touch OF_NOPRUNE=1 QUIET=1 cmd_snapshot pre-restore --quiet)
+  [[ -n $undo ]] && verify_snap "$undo" || die "could not save a pre-restore snapshot; nothing was changed"
+  while IFS= read -r f; do
+    if [[ -e $HOME/$f || -L $HOME/$f ]] && ! grep -qxF -- "$f" "$SNAPDIR/$undo/manifest"; then
+      die "couldn't save the current ~/$f before restoring; nothing was changed"
+    fi
+  done <"$tmp/touch"
+
+  local touched_hypr=0 touched_shell=0 n_done=0 failed=0 recreated=0
+  while IFS=$'\t' read -r s f; do
+    case $s in
+      W)
+        # Re-check right before writing: the tree may have changed since the plan.
+        if ! why=$(safe_path "$id" "$f" write); then warn "skipped ~/$f: $why"; failed=$((failed + 1)); continue; fi
+        [[ -e $HOME/$f || -L $HOME/$f ]] || recreated=1
+        if put_file "$SNAPDIR/$id/files/$f" "$HOME/$f"; then n_done=$((n_done + 1))
+        else warn "could not restore ~/$f"; failed=$((failed + 1)); continue; fi ;;
+      X)
+        if ! why=$(safe_path "$id" "$f" delete); then warn "kept ~/$f: $why"; failed=$((failed + 1)); continue; fi
+        if rm -f -- "$HOME/$f"; then n_done=$((n_done + 1)); else failed=$((failed + 1)); continue; fi ;;
+    esac
+    [[ $f == .config/hypr/* ]] && touched_hypr=1
+    [[ $f == .config/omarchy/* ]] && touched_shell=1
+  done <"$tmp/act"
+  prune_snapshots
+  say "${G}Restored $n_done file(s).${N} Undo with: $PROG restore $undo$( ((recreated)) && echo ' --delete')"
+  ((failed + skipped)) && warn "$((failed + skipped)) file(s) could not be restored (see above)"
+  ((touched_hypr)) && have hyprctl && hyprctl reload >/dev/null 2>&1 && say "Reloaded Hyprland."
+  ((touched_shell)) && say "Restart the Omarchy shell to pick up shell.json changes: omarchy-restart-shell"
+  ((failed + skipped == 0))
+}
+
+# --------------------------------------------------------------- incoming ---
+# Find the Omarchy release the next update would install, without root and
+# without touching the system's package databases.
+#   NEW_SHARE  its /usr/share/omarchy tree     NEW_BIN  its omarchy-* commands
+#   NEW_DESC   human label
+
+NEW_SHARE="" NEW_BIN="" NEW_DESC="" FETCH_NOTE=""
+
+extract_pkg() { # extract_pkg PKGFILE DEST
+  mkdir -p "$2"
+  if have bsdtar; then bsdtar -xf "$1" -C "$2" usr/share/omarchy usr/bin etc/skel 2>/dev/null
+  else tar -xf "$1" -C "$2" usr/share/omarchy usr/bin etc/skel 2>/dev/null; fi
+  return 0
+}
+
+NEW_ROOT=""
+use_tree() { # use_tree DIR  (an extracted package root or a source checkout)
+  local d=$1 x
+  if [[ -d $d/usr/share/omarchy ]]; then
+    NEW_SHARE=$d/usr/share/omarchy; NEW_BIN=$d/usr/bin
+  elif [[ -d $d/migrations ]]; then
+    NEW_SHARE=$d; NEW_BIN=$d/bin
+  else
+    return 1
+  fi
+  # Everything the release provides must really live inside it: a symlinked
+  # bin/ or migrations/ could otherwise point at your private files.
+  NEW_ROOT=$(realpath -e -- "$d") || return 1
+  for x in "$NEW_SHARE" "$NEW_SHARE/migrations" "$NEW_BIN"; do
+    [[ -e $x ]] || continue
+    x=$(realpath -e -- "$x") || return 1
+    [[ $x == "$NEW_ROOT" || $x == "$NEW_ROOT"/* ]] || die "$(tilde "$d") links outside itself ($(tilde "$x")); not using it"
+  done
+}
+
+fetch_incoming() {
+  local from=$1 offline=$2
+  local inc=$OF_CACHE/incoming
+  rm -rf "$inc"; mkdir -p "$inc"
+
+  if [[ -n $from ]]; then
+    if [[ -f $from ]]; then
+      extract_pkg "$from" "$inc"; use_tree "$inc" || die "$from does not look like an Omarchy package"
+    else
+      use_tree "$from" || die "$from is neither an Omarchy package tree nor a source checkout"
+    fi
+    NEW_DESC="from $(tilde "$from")"
+    return 0
+  fi
+
+  # Dev channel: OMARCHY_PATH is a git checkout. The update fast-forwards it
+  # from upstream, so upstream is what's coming.
+  if git -C "$OMARCHY_PATH" rev-parse --git-dir >/dev/null 2>&1; then
+    if ((!offline)); then git -C "$OMARCHY_PATH" fetch -q 2>/dev/null || FETCH_NOTE="git fetch failed; using last fetched upstream"; fi
+    local up; up=$(git -C "$OMARCHY_PATH" rev-parse --abbrev-ref '@{u}' 2>/dev/null) || up=""
+    if [[ -n $up ]]; then
+      git -C "$OMARCHY_PATH" archive "$up" | tar -x -C "$inc"
+      use_tree "$inc"
+      NEW_DESC="dev checkout → $up ($(git -C "$OMARCHY_PATH" rev-parse --short "$up"))"
+      return 0
+    fi
+  fi
+
+  # Packaged install: sync a private copy of the package databases (the same
+  # trick as checkupdates), then download the new omarchy package.
+  if ((!offline)) && have pacman; then
+    local pkgs=() p db=$OF_CACHE/db
+    for p in omarchy omarchy-dev omarchy-settings omarchy-settings-dev; do
+      pacman -Qq "$p" >/dev/null 2>&1 && pkgs+=("$p")
+    done
+    if ((${#pkgs[@]})); then
+      mkdir -p "$db"
+      ln -sfn /var/lib/pacman/local "$db/local"
+      local synced=0
+      if have fakeroot; then
+        fakeroot -- pacman -Sy --dbpath "$db" --logfile /dev/null >/dev/null 2>&1 && synced=1
+      elif have checkupdates; then
+        CHECKUPDATES_DB=$db checkupdates >/dev/null 2>&1; [[ -d $db/sync ]] && synced=1
+      fi
+      if ((synced)); then
+        local any=0 cur new url
+        for p in "${pkgs[@]}"; do
+          cur=$(LC_ALL=C pacman -Q "$p" | awk '{print $2}')
+          local info repo; info=$(LC_ALL=C pacman -Si --dbpath "$db" "$p" 2>/dev/null)
+          new=$(awk -F' *: ' '/^Version/{print $2; exit}' <<<"$info")
+          repo=$(awk -F' *: ' '/^Repository/{print $2; exit}' <<<"$info")
+          [[ -n $new && $(vercmp "$new" "$cur" 2>/dev/null) -gt 0 ]] || continue
+          url=$(pacman -Sddp --dbpath "$db" --logfile /dev/null "$p" 2>/dev/null | tail -1)
+          [[ -n $url ]] || continue
+          local file=$OF_CACHE/pkgs/${url##*/}
+          mkdir -p "$OF_CACHE/pkgs"
+          if [[ $url == file://* ]]; then cp -f "${url#file://}" "$file"
+          elif [[ ! -s $file ]]; then curl -fsSL -o "$file.part" "$url" && mv "$file.part" "$file" || { warn "could not download $url"; continue; }
+          fi
+          verify_pkg "$file" "$url" "$repo"
+          extract_pkg "$file" "$inc"
+          NEW_DESC+="${NEW_DESC:+, }$p $cur → $new"
+          any=1
+        done
+        if ((any)); then
+          # omarchy-settings alone carries no migrations; fill in the rest from what's installed.
+          [[ -d $inc/usr/share/omarchy/migrations ]] || cp -a "$OMARCHY_PATH/migrations" "$inc/usr/share/omarchy/" 2>/dev/null
+          [[ -d $inc/usr/share/omarchy/config ]] || cp -a "$OMARCHY_PATH/config" "$inc/usr/share/omarchy/" 2>/dev/null
+          use_tree "$inc"
+          return 0
+        fi
+        NEW_DESC="no newer Omarchy package (${pkgs[*]} up to date)"
+      else
+        FETCH_NOTE="could not sync a private package database (needs fakeroot or pacman-contrib); checked what's on disk only"
+      fi
+    fi
+  fi
+
+  # Nothing newer: migrations already on disk may still be pending (for
+  # example after a raw pacman -Syu).
+  NEW_SHARE=$OMARCHY_PATH
+  NEW_BIN=$(dirname "$(command -v omarchy-migrate 2>/dev/null || echo "$OMARCHY_PATH/bin/x")")
+  [[ -n $NEW_DESC ]] || NEW_DESC="installed Omarchy ($(omarchy_version))"
+}
+
+PKG_SIG="" ALLOW_UNSIGNED=0
+GNUPG_DIR=${OMAFORECAST_GNUPG_HOME:-/etc/pacman.d/gnupg}
+
+# sig_levels REPO: pacman.conf's SigLevel words for REPO (or the global ones).
+sig_levels() {
+  have pacman-conf || return 0
+  local lv; lv=$(pacman-conf --repo="$1" SigLevel 2>/dev/null)
+  [[ -n $lv ]] || lv=$(pacman-conf SigLevel 2>/dev/null)
+  printf '%s\n' "$lv"
+}
+
+# repo_requires_sig REPO: does pacman.conf demand package signatures there?
+# (pacman's default is Required.)
+repo_requires_sig() {
+  local t req=1
+  for t in $(sig_levels "$1"); do
+    case $t in
+      Required | PackageRequired) req=1 ;;
+      Optional | PackageOptional | Never | PackageNever) req=0 ;;
+    esac
+  done
+  ((req))
+}
+
+# repo_trusts_all REPO: SigLevel TrustAll (any valid signature from a key in
+# the keyring is enough, as pacman does).
+repo_trusts_all() {
+  local t all=0
+  for t in $(sig_levels "$1"); do
+    case $t in TrustAll | PackageTrustAll) all=1 ;; TrustedOnly | PackageTrustedOnly) all=0 ;; esac
+  done
+  ((all))
+}
+
+# sig_verdict FILE SIG REPO → verified | untrusted | bad | unavailable
+# Checks with gpg against a private copy of pacman's keyring and trust
+# database, so the key has to be one pacman would accept: known, not
+# revoked or expired, and fully trusted unless the repo says TrustAll.
+sig_verdict() {
+  local file=$1 sig=$2 repo=$3 h f st
+  have gpg || { echo unavailable; return; }
+  h=$(mktemp -d) || { echo unavailable; return; }
+  TMPS+=("$h")
+  for f in pubring.gpg pubring.kbx trustdb.gpg; do [[ -r $GNUPG_DIR/$f ]] && cp -- "$GNUPG_DIR/$f" "$h/"; done
+  [[ -s $h/pubring.gpg || -s $h/pubring.kbx ]] || { echo unavailable; return; }
+  st=$(gpg --homedir "$h" --batch --no-tty --no-auto-key-retrieve --status-fd 1 --verify -- "$sig" "$file" 2>/dev/null)
+  if grep -qE '^\[GNUPG:\] (BADSIG|ERRSIG|REVKEYSIG|EXPKEYSIG|EXPSIG|NO_PUBKEY|KEYREVOKED|KEYEXPIRED) ' <<<"$st" ||
+    ! grep -q '^\[GNUPG:\] VALIDSIG ' <<<"$st"; then
+    echo bad; return
+  fi
+  if grep -qE '^\[GNUPG:\] TRUST_(FULLY|ULTIMATE)' <<<"$st" || repo_trusts_all "$repo"; then echo verified
+  else echo untrusted; fi
+}
+
+# verify_pkg FILE URL REPO: check the detached signature the way pacman
+# would. A bad or untrusted signature always stops the forecast: its
+# migrations would run in the sandbox, and pacman would refuse the package.
+# A missing or uncheckable one stops it when pacman.conf requires
+# signatures for REPO. --allow-unsigned overrides both.
+verify_pkg() {
+  local file=$1 url=$2 repo=${3:-} v
+  rm -f "$file.sig"
+  if [[ $url == file://* ]]; then
+    [[ -f ${url#file://}.sig ]] && cp -f "${url#file://}.sig" "$file.sig"
+  else
+    curl -fsSL -o "$file.sig" "$url.sig" 2>/dev/null || rm -f "$file.sig"
+  fi
+  local why="no signature published"
+  if [[ -s $file.sig ]]; then
+    v=$(sig_verdict "$file" "$file.sig" "$repo")
+    case $v in
+      verified) PKG_SIG="signature verified"; return 0 ;;
+      bad | untrusted)
+        local what="does not verify (bad signature, or an unknown, revoked or expired key)"
+        [[ $v == untrusted ]] && what="is signed by a key pacman's keyring doesn't trust"
+        ((ALLOW_UNSIGNED)) && { PKG_SIG="BAD signature, used anyway (--allow-unsigned)"; return 0; }
+        die "the signature of ${url##*/} $what, so the download may have been tampered with. Not running its migrations. (Override with --allow-unsigned.)" ;;
+    esac
+    why="can't check it (needs gpg and a readable keyring in $(tilde "$GNUPG_DIR"))"
+  fi
+  if ((ALLOW_UNSIGNED)); then PKG_SIG="signature not checked: $why (--allow-unsigned)"; return 0; fi
+  if repo_requires_sig "$repo"; then
+    die "${url##*/}: $why, and pacman.conf requires signed packages${repo:+ from [$repo]}. Not running its migrations. (Override with --allow-unsigned.)"
+  fi
+  PKG_SIG="signature not checked: $why; pacman.conf doesn't require one${repo:+ for [$repo]}"
+}
+
+pending_migrations() {
+  local f
+  for f in "$NEW_SHARE"/migrations/*.sh; do
+    [[ -f $f ]] || continue
+    [[ -L $f ]] && { warn "skipping migration ${f##*/}: it is a symlink"; continue; }
+    # Omarchy names migrations <unix time>.sh. Anything else is reported, never
+    # run or used in a command: the name comes from the downloaded package.
+    if [[ ! ${f##*/} =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\.sh$ ]]; then
+      warn "skipping a migration with an unexpected file name: $(printf '%q' "${f##*/}")"; continue
+    fi
+    [[ -f $MIG_STATE/${f##*/} ]] || printf '%s\n' "${f##*/}"
+  done
+}
+
+mig_desc() {
+  local line
+  line=$(grep -m1 -E '^[[:space:]]*echo[[:space:]]' "$1") || return 0
+  line=${line#*echo}; line=${line# }; line=${line#-e }
+  case $line in
+    \"*) line=${line#\"}; line=${line%%\"*} ;;
+    \'*) line=${line#\'}; line=${line%%\'*} ;;
+  esac
+  printf '%s\n' "$line"
+}
+
+# Static read of a migration: which ~/ paths it names, which config it
+# resets, whether it uses sudo. Used for reporting and to decide what the
+# simulation needs to copy.
+mig_static_paths() {
+  local f=$1 x
+  grep -oE '(\$HOME|\$\{HOME\}|~)/\.[A-Za-z0-9_./-]+' "$f" | sed -E 's#^(\$HOME|\$\{HOME\}|~)/##; s#/+$##' | sed 's#\.\.\.$##'
+  grep -oE 'omarchy-refresh-config[[:space:]]+"?[A-Za-z0-9_./-]+' "$f" | awk '{gsub(/"/,"",$2); print ".config/" $2}'
+  for x in $(grep -oE 'omarchy-refresh-[a-z0-9-]+' "$f" | sort -u); do
+    [[ $x == omarchy-refresh-config ]] && continue
+    [[ -f $NEW_BIN/$x ]] && grep -oE 'omarchy-refresh-config[[:space:]]+[A-Za-z0-9_./-]+' "$NEW_BIN/$x" | awk '{print ".config/" $2}'
+  done
+  grep -q 'omarchy-reinstall-configs' "$f" && echo ".config"
+  return 0
+}
+
+# ------------------------------------------------------------- simulation ---
+# Run each pending migration against a throwaway copy of your config inside a
+# bubblewrap sandbox: read-only system, no network, no session bus, sudo and
+# service/package commands replaced by recorders. Then diff.
+
+STUBS=(sudo pkexec doas systemctl hyprctl notify-send makoctl omarchy-shell
+  pkill killall uwsm uwsm-app gsettings busctl loginctl reboot shutdown
+  pacman yay paru flatpak mise snapper limine-update limine-snapper-sync
+  mkinitcpio plymouth-set-default-theme fwupdmgr xdg-open chromium brave
+  omarchy-pkg-add omarchy-pkg-drop omarchy-pkg-aur-add omarchy-restart-shell
+  omarchy-restart-waybar omarchy-restart-walker omarchy-restart-xcompose
+  omarchy-restart-hyprsunset omarchy-restart-audio omarchy-restart-wifi
+  omarchy-restart-bluetooth omarchy-notification-dismiss omarchy-notification-send
+  omarchy-launch-floating-terminal-with-presentation gum)
+
+write_stubs() {
+  local dir=$1 s
+  mkdir -p "$dir"
+  cat >"$dir/.stub" <<'STUB'
+#!/bin/bash
+name=${0##*/}
+printf '%s\t%s %s\n' "${OF_MIG:-?}" "$name" "$*" >>"${OF_LOG:-/dev/null}"
+case $name in
+  pacman)
+    # Queries are harmless and migrations rely on them; anything else is recorded only.
+    [[ ${1:-} == -Q* || ${1:-} == --query ]] && exec /usr/bin/pacman "$@"
+    exit 0 ;;
+  gum)
+    case ${1:-} in
+      confirm) exit 0 ;;
+      spin) while (($#)) && [[ $1 != -- ]]; do shift; done; shift; exec "$@" ;;
+      style|format) shift; for a in "$@"; do [[ $a == -* ]] || printf '%s\n' "$a"; done; exit 0 ;;
+      choose) shift; for a in "$@"; do [[ $a == -* ]] || { printf '%s\n' "$a"; exit 0; }; done; exit 0 ;;
+      *) exit 0 ;;
+    esac ;;
+  hyprctl) [[ ${1:-} == -j ]] && echo '[]'; exit 0 ;;
+esac
+exit 0
+STUB
+  chmod +x "$dir/.stub"
+  for s in "${STUBS[@]}"; do ln -sf .stub "$dir/$s"; done
+}
+
+# copy_new_bins DEST: the incoming release's omarchy-* commands. A symlink is
+# followed only to a file inside the incoming tree (a link into the installed
+# /usr/share/omarchy means the same file in the new release), never to
+# anything else on this machine.
+copy_new_bins() {
+  local dest=$1 b t src share binr
+  [[ -d $NEW_BIN ]] || return 0
+  share=$(realpath -e -- "$NEW_SHARE") && binr=$(realpath -e -- "$NEW_BIN") || return 0
+  if [[ -n $NEW_ROOT ]]; then share=$NEW_ROOT binr=$NEW_ROOT; fi
+  for b in "$NEW_BIN"/omarchy*; do
+    if [[ -L $b ]]; then
+      t=$(readlink -- "$b")
+      [[ $t == "$OMARCHY_PATH"/* ]] && t=$NEW_SHARE/${t#"$OMARCHY_PATH"/}
+      [[ $t == /* ]] || t=$(dirname -- "$b")/$t
+      src=$(realpath -e -- "$t" 2>/dev/null) || continue
+    elif [[ -f $b ]]; then
+      src=$(realpath -e -- "$b") || continue
+    else continue; fi
+    [[ $src == "$share"/* || $src == "$binr"/* ]] || { warn "ignoring ${b##*/}: it points outside the incoming release"; continue; }
+    [[ -f $src ]] && cp -- "$src" "$dest/${b##*/}"
+  done
+  return 0
+}
+
+SIM_OK=0 SIM_NOTE=""
+simulate() { # simulate WORK MIGRATIONS...   fills $WORK/result/<mig>.changes
+  local work=$1; shift
+  if [[ -n ${OMAFORECAST_NO_SANDBOX:-} ]] || ! have bwrap; then
+    SIM_NOTE="bubblewrap (bwrap) not installed, so migrations were read but not dry-run. Install it with: sudo pacman -S bubblewrap"
+    return 1
+  fi
+  if ! bwrap --ro-bind / / --unshare-all --die-with-parent true 2>/dev/null; then
+    SIM_NOTE="bubblewrap can't create a sandbox here (user namespaces disabled?), so migrations were read but not dry-run"
+    return 1
+  fi
+
+  local home=$work/home
+  mkdir -p "$home" "$work/result" "$work/mig" "$work/newbin"
+  # Your tracked config, plus Omarchy's per-user state, plus anything the
+  # pending migrations name explicitly.
+  list_files "$HOME" >"$work/scope"
+  scope_entries | sed '/^$/d' | sort -u >"$work/scope.entries"
+  local m p
+  {
+    if [[ -d $HOME/.local/state/omarchy ]]; then
+      (cd "$HOME" && find .local/state/omarchy -type f -size -2048k 2>/dev/null) |
+        while IFS= read -r p; do excluded "$p" || printf '%s\n' "$p"; done
+    fi
+    for m in "$@"; do
+      mig_static_paths "$NEW_SHARE/migrations/$m" | while IFS= read -r p; do
+        # The migration's own text picks these paths, so only take ones you
+        # already track, or a shell or git rc file. Never ~/.ssh, keyrings,
+        # tokens or anything else outside your config.
+        [[ $p != *..* ]] || continue
+        case $p in
+          .bashrc | .bash_profile | .profile | .zshrc | .inputrc | .gitconfig | .XCompose) ;;
+          *) under_any "$p" "$work/scope.entries" || continue ;;
+        esac
+        excluded "$p" && continue
+        # A tracked directory's files are already copied (with your excludes
+        # applied); only single files are added here.
+        [[ -f $HOME/$p && ! -d $HOME/$p ]] && echo "$p"
+      done
+    done
+  } >"$work/extra"
+  sort -u "$work/scope" "$work/extra" >"$work/all"
+  copy_tree "$HOME" "$home" "$work/all"
+  cp -a "$NEW_SHARE/migrations/." "$work/mig/" 2>/dev/null
+  write_stubs "$work/stubs"
+  copy_new_bins "$work/newbin"
+  mkdir -p "$work/log"; : >"$work/log/actions.log"
+
+  # bwrap resolves mount sources on the host and targets in the sandbox.
+  # Only the throwaway home and the action log are writable. /run is masked so
+  # no host service socket (session bus, docker, systemd) is reachable.
+  # Only system directories are visible, not the whole host: no other homes,
+  # /opt, /srv, /mnt, /media or data disks a migration could read secrets from.
+  local args=() e
+  for e in /*; do
+    case $e in
+      /usr | /etc) [[ -d $e && ! -L $e ]] && args+=(--ro-bind "$e" "$e") ;;
+      /bin | /sbin | /lib | /lib64 | /lib32)
+        if [[ -L $e ]]; then args+=(--symlink "$(readlink "$e")" "$e"); elif [[ -d $e ]]; then args+=(--ro-bind "$e" "$e"); fi ;;
+    esac
+  done
+  [[ -d /var/lib ]] && args+=(--ro-bind /var/lib /var/lib)
+  args+=(--dev /dev --proc /proc --tmpfs /tmp --tmpfs /var/tmp --tmpfs /run)
+  args+=(--ro-bind "$work" /tmp/of --bind "$work/log" /tmp/of/log)
+  local b
+  for b in "$work"/newbin/*; do
+    [[ -e $b && -f /usr/bin/${b##*/} && ! -L /usr/bin/${b##*/} ]] && args+=(--ro-bind "$b" "/usr/bin/${b##*/}")
+  done
+  for b in sudo pkexec systemctl hyprctl notify-send reboot shutdown; do
+    [[ -f /usr/bin/$b && ! -L /usr/bin/$b ]] && args+=(--ro-bind "$work/stubs/.stub" "/usr/bin/$b")
+  done
+  args+=(--bind "$home" "$HOME")
+  # Make the incoming release appear where the real one lives.
+  local omp_in=$OMARCHY_PATH
+  if [[ -d $OMARCHY_PATH ]]; then
+    args+=(--ro-bind "$NEW_SHARE" "$OMARCHY_PATH")
+  else
+    omp_in=/tmp/of-new; args+=(--ro-bind "$NEW_SHARE" /tmp/of-new)
+  fi
+  args+=(--unshare-all --die-with-parent --new-session --clearenv
+    --setenv HOME "$HOME" --setenv USER "${USER:-$(id -un)}" --setenv LOGNAME "${USER:-$(id -un)}"
+    --setenv PATH "/tmp/of/stubs:/tmp/of/newbin:/usr/local/bin:/usr/bin:/bin"
+    --setenv OMARCHY_PATH "$omp_in" --setenv TERM dumb --setenv LANG "${LANG:-C.UTF-8}"
+    --setenv XDG_RUNTIME_DIR /tmp --setenv OMARCHY_UPDATE_UNATTENDED 1
+    --setenv OMAFORECAST_SIM 1 --setenv OF_LOG /tmp/of/log/actions.log)
+
+  local prev=$work/state.0 i=0 rc
+  cp -a "$home" "$prev"
+  for m in "$@"; do
+    i=$((i + 1))
+    # The marker is written inside the sandbox too: the host never writes into
+    # the sandbox's home, where a migration could have planted a symlink.
+    timeout "$SIM_TIMEOUT" bwrap "${args[@]}" --setenv OF_MIG "${m%.sh}" --setenv OF_NAME "$m" \
+      bash -c 'bash -euo pipefail "/tmp/of/mig/$OF_NAME"; rc=$?; mkdir -p "$HOME/.local/state/omarchy/migrations"; touch "$HOME/.local/state/omarchy/migrations/$OF_NAME"; exit $rc' \
+      >"$work/result/$m.out" 2>&1 </dev/null
+    rc=$?
+    echo "$rc" >"$work/result/$m.rc"
+    (cd "$prev" && find . \( -type f -o -type l \) | sed 's#^\./##' | grep -v '^\.local/state/omarchy/migrations/') >"$work/l.old"
+    (cd "$home" && find . \( -type f -o -type l \) | sed 's#^\./##' | grep -v '^\.local/state/omarchy/migrations/') >"$work/l.new"
+    sim_changes "$prev" "$work/l.old" "$home" "$work/l.new" | M=${m%.sh} awk '{print ENVIRON["M"] "\t" $0}' >"$work/result/$m.changes"
+    prev=$work/state.$i; cp -a "$home" "$prev"
+  done
+  SIM_OK=1
+}
+
+# ---------------------------------------------------------------- forecast --
+
+# classify REL → "customized" | "stock" | "yours"
+classify() {
+  local rel=$1 shipped
+  [[ $rel == .config/* ]] || { echo yours; return; }
+  shipped=$OMARCHY_PATH/config/${rel#.config/}
+  if [[ -f $shipped ]]; then
+    if same_file "$HOME/$rel" "$shipped"; then echo stock; else echo customized; fi
+  else echo yours; fi
+}
+
+tag() {
+  case $1 in
+    customized) printf '%s[you customized this]%s' "$R" "$N" ;;
+    yours) printf '%s[your file]%s' "$R" "$N" ;;
+    stock) printf '%s[stock Omarchy default]%s' "$D" "$N" ;;
+  esac
+}
+
+cmd_check() {
+  local from="" offline=0 show=0 snapshot=1 sim=1 exitcode=0
+  while (($#)); do
+    case $1 in
+      --from) from=${2:?--from needs a path}; shift ;;
+      --offline) offline=1 ;;
+      --diff | -d) show=1 ;;
+      --no-snapshot) snapshot=0 ;;
+      --no-sim) sim=0 ;;
+      --exit-code) exitcode=1 ;;
+      --allow-unsigned) ALLOW_UNSIGNED=1 ;;
+      -q | --quiet) QUIET=1 ;;
+      *) die "check: unknown option $1" ;;
+    esac
+    shift
+  done
+
+  hdr "omaforecast: what will the next Omarchy update do to your config?"
+  say "${D}Looking for the incoming release…${N}"
+  fetch_incoming "$from" "$offline"
+  say "Incoming: ${C}$NEW_DESC${N}${PKG_SIG:+ ${D}($PKG_SIG)${N}}"
+  [[ -n $FETCH_NOTE ]] && warn "$FETCH_NOTE"
+
+  local pend; mapfile -t pend < <(pending_migrations)
+  mkdir -p "$OF_CACHE"
+  local work; work=$(mktemp -d "$OF_CACHE/run.XXXXXX"); TMPS+=("$work")
+  local diffs=$OF_STATE/last-forecast.diff
+  mkdir -p "$OF_STATE" && chmod 700 "$OF_STATE" "$OF_CACHE"; : >"$diffs"; chmod 600 "$diffs"
+
+  local n_cust=0 n_stock=0 n_your=0 n_new=0 n_fail=0
+  local -A HIT=()
+  if ((${#pend[@]} == 0)); then
+    hdr "${G}✓ No pending migrations.${N} The update will install packages but won't run anything against your config."
+  else
+    say "Pending migrations: ${B}${#pend[@]}${N} (they run as you, right after the packages install)"
+    ((sim)) && simulate "$work" "${pend[@]}"
+    ((SIM_OK)) || { [[ -n $SIM_NOTE ]] && warn "$SIM_NOTE"; ((sim)) || true; }
+
+    local m desc rc ch cls s f mid idx=0
+    for m in "${pend[@]}"; do
+      idx=$((idx + 1)); mid=${m%.sh}
+      desc=$(mig_desc "$NEW_SHARE/migrations/$m")
+      if ((SIM_OK)); then
+        ch=$work/result/$m.changes rc=$(cat "$work/result/$m.rc")
+        local own=0
+        while IFS=$'\t' read -r _ s f; do
+          [[ $f == .local/state/omarchy/* || $f == .cache/* ]] && continue
+          own=1
+        done <"$ch"
+        if ((own)); then printf '\n %s✗%s %s%s%s  %s\n' "$Y" "$N" "$B" "$mid" "$N" "$desc"
+        elif [[ $rc != 0 ]]; then printf '\n %s?%s %s%s%s  %s\n' "$Y" "$N" "$B" "$mid" "$N" "$desc"
+        else printf '\n %s✓%s %s%s%s  %s\n' "$G" "$N" "$B" "$mid" "$N" "$desc"; fi
+        while IFS=$'\t' read -r _ s f; do
+          [[ $f == .local/state/omarchy/* || $f == .cache/* ]] && continue
+          if [[ $s == A && $f == *.bak.* ]]; then
+            printf '     %skeeps a backup at ~/%s%s\n' "$D" "$f" "$N"
+            continue
+          fi
+          if [[ -e $HOME/$f ]]; then cls=$(classify "$f"); else cls=new; fi
+          HIT[$f]=$cls
+          printf '     would %s ~/%s %s\n' "$(case $s in M) echo modify;; A) echo create;; D) echo delete;; esac)" "$f" "$( [[ $cls == new ]] && printf '%s[new file]%s' "$D" "$N" || tag "$cls")"
+          show_diff_into "$work" "$idx" "$m" "$f" >>"$diffs"
+        done <"$ch"
+        if ((!own)) && [[ $rc == 0 ]]; then printf '     %sno changes to your config%s\n' "$D" "$N"; fi
+        local acts; acts=$(awk -F'\t' -v m="$mid" '$1==m{print $2}' "$work/log/actions.log" | sort -u | grep -vE '^(gum (style|format|spin)|pacman -Q)' | head -6)
+        [[ -n $acts ]] && printf '     %salso wants to run:%s\n%s\n' "$D" "$N" "$(sed 's/^/       /' <<<"$acts" | cut -c1-96)"
+        mkdir -p "$OF_STATE/sim-logs" && chmod 700 "$OF_STATE/sim-logs"; cp "$work/result/$m.out" "$OF_STATE/sim-logs/$mid.log"; chmod 600 "$OF_STATE/sim-logs/$mid.log"
+        if [[ $rc != 0 ]]; then
+          n_fail=$((n_fail + 1))
+          printf '     %sdry run exited %s (log: %s). If this is a real error, omarchy-migrate would stop here too.%s\n' "$Y" "$rc" "$(tilde "$OF_STATE/sim-logs/$mid.log")" "$N"
+          static_mentions "$NEW_SHARE/migrations/$m"
+        fi
+      else
+        printf '\n %s?%s %s%s%s  %s\n' "$Y" "$N" "$B" "$mid" "$N" "$desc"
+        static_mentions "$NEW_SHARE/migrations/$m"
+      fi
+    done
+  fi
+
+  local k
+  for k in "${!HIT[@]}"; do
+    case ${HIT[$k]} in customized) n_cust=$((n_cust + 1)) ;; stock) n_stock=$((n_stock + 1)) ;; yours) n_your=$((n_your + 1)) ;; new) n_new=$((n_new + 1)) ;; esac
+  done
+
+  package_edits
+  new_defaults
+
+  hdr "Summary"
+  if ((SIM_OK)); then
+    ((n_fail)) && say " ${Y}$n_fail dry run(s) didn't finish${N}, so the forecast for those is partial (see the files they mention above)."
+    if ((n_cust + n_your > 0)); then
+      say " ${R}$((n_cust + n_your)) file(s) you changed would be rewritten.${N} Also: $n_stock stock, $n_new new."
+    elif ((n_stock > 0)); then
+      say " ${G}None of your customizations are touched.${N} $n_stock stock file(s) would be updated, $n_new created."
+    elif ((n_new > 0)); then
+      say " ${G}None of your customizations are touched.${N} $n_new new file(s) would be created."
+    elif ((n_fail)); then
+      :
+    else
+      say " ${G}This update leaves your config alone.${N}"
+    fi
+    [[ -s $diffs ]] && say " Full diff: ${C}$PROG check --diff${N}  (saved to $(tilde "$diffs"))"
+  fi
+  if ((snapshot)); then
+    printf '%s\n' "${!HIT[@]}" | grep -v '^$' >"$work/hit" || true
+    local id
+    if id=$(OF_EXTRA_FILES=$work/hit QUIET=1 cmd_snapshot pre-update --quiet) && [[ -n $id ]]; then
+      say " ${G}Snapshot saved:${N} $id"
+      say " After the update, undo it with: ${C}$PROG restore${N}  (or one file: $PROG restore <path>)"
+    else
+      say " ${R}No snapshot was saved${N} (see the error above). Fix that before updating."
+      ((exitcode)) && return 4
+    fi
+  fi
+  if ((show)) && [[ -s $diffs ]]; then hdr "Diffs"; cat "$diffs"; fi
+  ((exitcode && n_cust + n_your > 0)) && return 3
+  return 0
+}
+
+static_mentions() {
+  local p
+  while IFS= read -r p; do
+    [[ -n $p ]] || continue
+    printf '     mentions ~/%s %s\n' "$p" "$( [[ -f $HOME/$p ]] && tag "$(classify "$p")")"
+  done < <(mig_static_paths "$1" | sort -u)
+  grep -qE '(^|[^a-z-])sudo[[:space:]]' "$1" && printf '     %suses sudo%s\n' "$D" "$N"
+  return 0
+}
+
+show_diff_into() { # show_diff_into WORK INDEX MIG FILE: state before vs after one migration
+  local work=$1 idx=$2 m=$3 f=$4
+  local a=$work/state.$((idx - 1)) b=$work/state.$idx
+  # Never read through a symlinked directory the migration may have planted.
+  if anc_link "$a" "$f"; then a=/dev/null; else a=$a/$f; fi
+  if anc_link "$b" "$f"; then b=/dev/null; else b=$b/$f; fi
+  show_diff "$a" "$b" "~/$f  (${m%.sh})" | sed 's/\x1b\[[0-9;]*m//g'
+}
+
+package_edits() {
+  have pacman || return 0
+  local pkgs=() p
+  for p in omarchy omarchy-dev omarchy-settings omarchy-settings-dev; do pacman -Qq "$p" >/dev/null 2>&1 && pkgs+=("$p"); done
+  ((${#pkgs[@]})) || return 0
+  local out; out=$(LC_ALL=C pacman -Qkk "${pkgs[@]}" 2>&1 | grep -E 'SHA256 checksum mismatch|Size mismatch' | grep -oE '/(usr/share/omarchy|etc|usr/bin)/[^ ]+' | sort -u | head -20)
+  [[ -n $out ]] || return 0
+  hdr "Package files you edited by hand"
+  say " The update replaces these with the new package's copy (files in /etc get a .pacnew instead):"
+  sed 's/^/   /' <<<"$out"
+  say " ${D}Move those edits into ~/.config, where Omarchy expects overrides.${N}"
+}
+
+new_defaults() {
+  [[ $NEW_SHARE != "$OMARCHY_PATH" && -d $NEW_SHARE/config && -d $OMARCHY_PATH/config ]] || return 0
+  local f rel out=()
+  while IFS= read -r f; do
+    rel=${f#"$NEW_SHARE"/config/}
+    same_file "$NEW_SHARE/config/$rel" "$OMARCHY_PATH/config/$rel" && continue
+    [[ -f $HOME/.config/$rel ]] || continue
+    same_file "$HOME/.config/$rel" "$OMARCHY_PATH/config/$rel" && continue
+    out+=("$rel")
+  done < <(find "$NEW_SHARE/config" -type f 2>/dev/null)
+  ((${#out[@]})) || return 0
+  hdr "New Omarchy defaults you won't get automatically"
+  say " Upstream changed these, but you've customized your copy, so the update leaves yours alone:"
+  for rel in "${out[@]}"; do
+    printf '   ~/.config/%s\n' "$rel"
+    show_diff "$OMARCHY_PATH/config/$rel" "$NEW_SHARE/config/$rel" "new default: config/$rel" | sed 's/\x1b\[[0-9;]*m//g' >>"$OF_STATE/last-forecast.diff"
+  done
+  say " ${D}What changed upstream is in the full diff.${N}"
+}
+
+# ------------------------------------------------------------------ report --
+# Run after an update (installed as an Omarchy post-update hook).
+
+cmd_report() {
+  local hook=0 notify=0
+  while (($#)); do
+    case $1 in --hook) hook=1 notify=1 ;; --notify) notify=1 ;; *) die "report: unknown option $1" ;; esac
+    shift
+  done
+  local id; id=$(resolve_snap pre-update)
+  if [[ -z $id ]]; then
+    ((hook)) || say "No pre-update snapshot found. Next time run '$PROG check' (or '$PROG update') first."
+    return 0
+  fi
+  local tmp; tmp=$(mktemp -d); TMPS+=("$tmp")
+  now_list "$id" >"$tmp/now"
+  changes "$SNAPDIR/$id/files" "$SNAPDIR/$id/manifest" "$HOME" "$tmp/now" >"$tmp/ch"
+  local baks pacnew
+  baks=$(find "$HOME/.config" -newer "$SNAPDIR/$id/meta" -name '*.bak.*' -type f 2>/dev/null | head -20)
+  pacnew=$(find /etc -newer "$SNAPDIR/$id/meta" \( -name '*.pacnew' -o -name '*.pacsave' \) 2>/dev/null | head -20)
+
+  hdr "omaforecast: what the update changed in your config (since $id)"
+  if [[ ! -s $tmp/ch ]]; then
+    say " ${G}Nothing changed.${N}"
+  else
+    local s f
+    while IFS=$'\t' read -r s f; do printf '  %s  ~/%s\n' "$(status_word "$s")" "$f"; done <"$tmp/ch"
+    say ""
+    say " See the diff:   $PROG diff $id"
+    say " Undo all:       $PROG restore $id"
+    say " Undo one file:  $PROG restore $id ~/<path>"
+  fi
+  [[ -n $baks ]] && { say ""; say " Omarchy saved these backups during the update:"; sed "s#^$HOME#   ~#" <<<"$baks"; }
+  [[ -n $pacnew ]] && { say ""; say " New .pacnew/.pacsave files to review (sudo pacdiff):"; sed 's/^/   /' <<<"$pacnew"; }
+  if ((notify)) && [[ -s $tmp/ch ]] && have notify-send; then
+    notify-send -a omaforecast "Update changed $(wc -l <"$tmp/ch") config file(s)" "Run '$PROG restore' to undo." 2>/dev/null || true
+  fi
+  QUIET=1 cmd_snapshot post-update --quiet >/dev/null
+  return 0
+}
+
+# ------------------------------------------------------------------ update --
+
+cmd_update() {
+  local args=()
+  while (($#)); do
+    case $1 in -y | --yes) ASSUME_YES=1 ;; *) args+=("$1") ;; esac
+    shift
+  done
+  cmd_check --exit-code
+  local rc=$?
+  if ((rc == 3)); then
+    echo
+    confirm "This update rewrites files you've changed (snapshot saved). Continue?" || { say "Update cancelled."; return 1; }
+  elif ((rc != 0)); then
+    return "$rc"
+  fi
+  cleanup; TMPS=()
+  if have omarchy-update; then exec omarchy-update "${args[@]}"
+  elif have omarchy; then exec omarchy update "${args[@]}"
+  else die "omarchy-update not found"; fi
+}
+
+# ------------------------------------------------------------ setup/remove --
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+HOOK_FILE=$HOME/.config/omarchy/hooks/post-update.d/50-omaforecast
+MENU_FILE=$HOME/.config/omarchy/extensions/omarchy-menu.jsonc
+PAC_HOOK=/etc/pacman.d/hooks/90-omaforecast-snapshot.hook
+SYS_DIR=/usr/local/lib/omaforecast
+
+menu_block() {
+  local upd=$1
+  cat <<'JSONC'
+  // >>> omaforecast (managed block; `omaforecast uninstall` removes it)
+  "update.forecast": {"icon":"󰖐","label":"Forecast","description":"Preview what the next update changes in your config","action":"omarchy-launch-floating-terminal-with-presentation 'omaforecast check'"},
+  "update.rollback": {"icon":"󰕌","label":"Config Rollback","description":"Restore config from before the last update","action":"omarchy-launch-floating-terminal-with-presentation 'omaforecast restore'"},
+JSONC
+  ((upd)) && echo "  \"update.omarchy\": {\"action\":\"omarchy-launch-floating-terminal-with-presentation 'omaforecast update'\"},"
+  echo "  // <<< omaforecast"
+}
+
+remove_menu_block() {
+  [[ -f $MENU_FILE ]] || return 0
+  sed -i --follow-symlinks '/\/\/ >>> omaforecast/,/\/\/ <<< omaforecast/d' "$MENU_FILE"
+}
+
+cmd_setup() {
+  umask 022   # the hook, menu file and system files are not private
+  local menu=1 hook=1 pac=0 upd=0
+  while (($#)); do
+    case $1 in
+      --no-menu) menu=0 ;; --no-hook) hook=0 ;;
+      --pacman-hook) pac=1 ;; --menu-update) upd=1 ;;
+      *) die "setup: unknown option $1" ;;
+    esac
+    shift
+  done
+  if ((hook)); then
+    mkdir -p "$(dirname "$HOOK_FILE")"
+    {
+      echo '#!/bin/bash'
+      echo '# Installed by omaforecast: after an Omarchy update, show which of your'
+      echo '# config files it changed and how to undo it. Remove with: omaforecast uninstall'
+      printf 'self=%q\n' "$SELF"
+      echo 'if [[ -x $self ]]; then "$self" report --hook; elif command -v omaforecast >/dev/null; then omaforecast report --hook; fi'
+      echo 'exit 0'
+    } >"$HOOK_FILE"
+    chmod 755 "$HOOK_FILE"
+    say "${G}✓${N} post-update hook: $(tilde "$HOOK_FILE")"
+  fi
+  if ((menu)); then
+    mkdir -p "$(dirname "$MENU_FILE")"
+    [[ -f $MENU_FILE ]] || printf '{\n}\n' >"$MENU_FILE"
+    remove_menu_block
+    local tmp; tmp=$(mktemp)
+    # Insert right after the opening brace so every entry can carry a comma
+    # (Omarchy's JSONC reader drops trailing commas before the closing brace).
+    awk -v block="$(menu_block "$upd")" 'done != 1 && /^[[:space:]]*\{[[:space:]]*$/ {print; print block; done=1; next} {print}' "$MENU_FILE" >"$tmp"
+    if grep -q '>>> omaforecast' "$tmp"; then cat "$tmp" >"$MENU_FILE"; say "${G}✓${N} menu: Update › Forecast and Update › Config Rollback$( ((upd)) && echo ', and Update › Omarchy now runs the forecast first')"
+    else warn "couldn't find the opening { in $(tilde "$MENU_FILE"); menu entries not added"; fi
+    rm -f "$tmp"
+  fi
+  if ((pac)); then
+    say "Installing the pacman hook (needs sudo) so every update snapshots your config first,"
+    say "even when started from the bar icon or plain 'omarchy update'."
+    sudo install -d -m755 "$SYS_DIR" /etc/pacman.d/hooks &&
+      sudo install -m755 "$SELF" "$SYS_DIR/omaforecast" &&
+      sudo tee "$SYS_DIR/pacman-hook" >/dev/null <<'PH' &&
+#!/bin/bash
+# Snapshot each Omarchy user's config before the omarchy packages upgrade.
+# Runs as root from pacman, drops to each user. Never blocks the transaction.
+while IFS=: read -r user _ uid _ _ home shell; do
+  ((uid >= 1000 && uid < 60000)) || continue
+  [[ -d $home/.local/state/omarchy ]] || continue
+  [[ $shell == */nologin || $shell == */false ]] && continue
+  # Always a fresh snapshot: unchanged files are hardlinked, so it's cheap.
+  timeout 120 runuser -u "$user" -- env HOME="$home" /usr/local/lib/omaforecast/omaforecast snapshot pre-update --quiet >/dev/null 2>&1 ||
+    echo "omaforecast: WARNING: could not snapshot $user's config; run 'omaforecast snapshot' before relying on restore"
+done </etc/passwd
+exit 0
+PH
+      sudo chmod 755 "$SYS_DIR/pacman-hook" &&
+      sudo install -Dm644 /dev/stdin "$PAC_HOOK" <<'HK' && say "${G}✓${N} pacman hook: $PAC_HOOK"
+[Trigger]
+Operation = Upgrade
+Type = Package
+Target = omarchy
+Target = omarchy-dev
+Target = omarchy-settings
+Target = omarchy-settings-dev
+
+[Action]
+Description = omaforecast: snapshotting Omarchy user config before the upgrade...
+When = PreTransaction
+Exec = /usr/local/lib/omaforecast/pacman-hook
+HK
+  fi
+  ((pac)) || say "${D}Optional: '$PROG setup --pacman-hook' snapshots automatically before every update (needs sudo once).${N}"
+}
+
+cmd_uninstall() {
+  local purge=0
+  [[ ${1:-} == --purge ]] && purge=1
+  rm -f "$HOOK_FILE" && say "removed post-update hook"
+  remove_menu_block && say "removed menu entries"
+  if [[ -e $PAC_HOOK || -d $SYS_DIR ]]; then
+    sudo rm -rf "$PAC_HOOK" "$SYS_DIR" && say "removed pacman hook"
+  fi
+  if ((purge)); then rm -rf "$OF_STATE" "$OF_CACHE" && say "removed snapshots and cache"
+  else say "kept snapshots in $(tilde "$OF_STATE") (use --purge to delete them)"; fi
+  if [[ $SELF == "$HOME"/* && -w $(dirname "$SELF") ]]; then
+    rm -f "$SELF" && say "removed $(tilde "$SELF")"
+  else
+    say "left $SELF in place (not installed by the user installer)"
+  fi
+  return 0
+}
+
+usage() {
+  cat <<USAGE
+${B}omaforecast $VERSION${N}: see what the next Omarchy update will do to your config before it runs.
+
+${B}Usage:${N} $PROG <command> [options]
+
+  ${B}check${N}            Dry-run the incoming update's migrations against a sandboxed copy
+                   of your config, list every file they'd change, and snapshot first.
+                   --diff  show the diffs   --offline  don't fetch   --from PATH  use a
+                   package file / extracted tree / checkout   --no-snapshot   --exit-code
+  ${B}update${N} [-y]      check, ask if your customized files are affected, then run omarchy update
+  ${B}restore${N} [SNAP] [PATH...]
+                   Put files back from a snapshot (default: the last pre-update one).
+                   Saves a pre-restore snapshot first, so a restore is undoable.
+                   --dry-run  --yes  --delete (also remove files added since)
+  ${B}diff${N} [SNAP] [PATH...]   What changed since a snapshot (default: latest). --stat
+  ${B}report${N}           After an update: what it changed, new .bak and .pacnew files
+  ${B}snapshot${N} [LABEL] Snapshot your Omarchy config now
+  ${B}list${N}             List snapshots
+  ${B}setup${N}            Install the post-update hook and menu entries
+                   --pacman-hook  also snapshot automatically before every update (sudo)
+                   --menu-update  make Update › Omarchy run the forecast first
+                   --no-menu --no-hook
+  ${B}uninstall${N} [--purge]
+
+Snapshots: $(tilde "$SNAPDIR")   Scope: Omarchy's shipped ~/.config files + extras;
+add paths to $(tilde "$OF_CONF/include"), globs to $(tilde "$OF_CONF/exclude").
+USAGE
+}
+
+main() {
+  local cmd=${1:-help}
+  (($#)) && shift
+  case $cmd in
+    check | forecast | preview) cmd_check "$@" ;;
+    update | up) cmd_update "$@" ;;
+    restore | rollback | undo) cmd_restore "$@" ;;
+    diff) cmd_diff "$@" ;;
+    report) cmd_report "$@" ;;
+    snapshot | snap) cmd_snapshot "$@" ;;
+    list | ls) cmd_list ;;
+    setup | install) cmd_setup "$@" ;;
+    uninstall | remove) cmd_uninstall "$@" ;;
+    version | --version | -v) echo "$PROG $VERSION" ;;
+    help | --help | -h) usage ;;
+    *) usage >&2; exit 1 ;;
+  esac
+}
+
+[[ ${OMAFORECAST_SOURCED:-} ]] || main "$@"

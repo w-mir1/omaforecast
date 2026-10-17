@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -S warning bin/omaforecast install.sh test/*.sh
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: smoke test (no root, no Docker)
+        run: test/smoke.sh
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: [shellcheck, smoke]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: end-to-end test in an Arch Linux container
+        run: test/run-e2e.sh
+      - name: upload test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e
+          path: |
+            .work/e2e/e2e.log
+            .work/e2e/*.txt
+          if-no-files-found: ignore
