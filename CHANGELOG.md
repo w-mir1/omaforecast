@@ -2,6 +2,21 @@
 
 All notable changes to this project are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] - 2026-10-18
+
+### Fixed
+
+- `check` no longer prints an empty forecast when bubblewrap is missing or can't create a sandbox (for example when the system blocks user namespaces). It says why, exits with code 5, and `omaforecast update` stops. `--no-sim` still skips the dry run on purpose.
+- A folder that `find` couldn't list while building the file list now stops the snapshot, even when a later pass could list it, so a snapshot can't be published with files silently missing.
+- Excluding an unreadable folder now lets the snapshot go ahead, as documented. Before, `find`'s error messages in a non-English locale weren't recognized, and the symlink pass failed on the folder regardless.
+- The exclude-list check now reads the error reason only, so a config path that happens to contain words such as "No such file or directory" can't make an unsearchable exclude list look absent.
+- The sandbox no longer sees all of `/var/lib`, only pacman's database in `/var/lib/pacman`.
+- A migration can no longer replace the dry run's action log with a symlink to make omaforecast print one of your files in the report.
+
+### Changed
+
+- CI allows unprivileged user namespaces on the Ubuntu runner so the end-to-end test can create its sandbox, and the end-to-end test now stops early with a clear message when it can't.
+
 ## [0.1.0] - 2026-10-17
 
 First release.
@@ -26,4 +41,5 @@ First release.
 - An exclude list that can't be read, or sits in a folder that can't be searched, stops omaforecast instead of being ignored. Excludes also apply to the Omarchy state copied into the sandbox.
 - An end-to-end test builds real pacman packages from Omarchy source and checks the forecast against the real update. A smoke test runs without root or Docker.
 
+[0.1.1]: https://github.com/w-mir1/omaforecast/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/w-mir1/omaforecast/releases/tag/v0.1.0

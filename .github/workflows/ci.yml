@@ -27,6 +27,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      # Ubuntu 24.04 runners block unprivileged user namespaces through
+      # AppArmor, and the dry run's bubblewrap sandbox needs one.
+      - name: allow unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          sudo sysctl -w user.max_user_namespaces=15000 || true
       - name: end-to-end test in an Arch Linux container
         run: test/run-e2e.sh
       - name: upload test output

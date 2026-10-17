@@ -37,6 +37,12 @@ pacman -Sy --noconfirm omarchy >/dev/null && ok "installed omarchy 4.0.3"
 
 step "Create user (gets Omarchy's /etc/skel) and customize their config"
 useradd -m -G wheel dev
+# The forecast needs an unprivileged user namespace. Say so plainly if the host blocks it.
+if ! as_dev 'bwrap --ro-bind / / --unshare-all --die-with-parent true' 2>/work/bwrap-preflight.txt; then
+  echo "bubblewrap can't create a sandbox in this container: $(head -1 /work/bwrap-preflight.txt)" >&2
+  echo "On Ubuntu 24.04 hosts run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0" >&2
+  exit 2
+fi
 echo 'dev ALL=(ALL) NOPASSWD: ALL' >/etc/sudoers.d/dev
 install -Dm755 /omaforecast/bin/omaforecast /home/dev/.local/bin/omaforecast
 chown -R dev:dev /home/dev/.local
@@ -162,21 +168,26 @@ as_dev 'cd /tmp/evcwd && omaforecast check --offline --no-snapshot --from /tmp/e
 
 step "A migration can't pull private files into the sandbox"
 mkdir -p /tmp/leaktree/migrations
-printf 'echo "Leak a key"\n# $HOME/.config/hypr\nmkdir -p "$HOME/.config/hypr"\ncat "$HOME/.ssh/id_rsa" > "$HOME/.config/hypr/leaked-key" || true\ncat "$HOME/.config/hypr/secrets.env" >> "$HOME/.config/hypr/leaked-key" || true\ncat /tmp/of/newbin/omarchy-leak >> "$HOME/.config/hypr/leaked-key" || true\ncat /srv/dotfiles-test/secret.env >> "$HOME/.config/hypr/leaked-key" || true\ncat /opt/dotfiles-test/secret.env "$HOME/.local/state/omarchy/toggles/secret.env" >> "$HOME/.config/hypr/leaked-key" || true\n' >/tmp/leaktree/migrations/1799999999.sh
+printf 'echo "Leak a key"\n# $HOME/.config/hypr\nmkdir -p "$HOME/.config/hypr"\ncat "$HOME/.ssh/id_rsa" > "$HOME/.config/hypr/leaked-key" || true\ncat "$HOME/.config/hypr/secrets.env" >> "$HOME/.config/hypr/leaked-key" || true\ncat /tmp/of/newbin/omarchy-leak >> "$HOME/.config/hypr/leaked-key" || true\ncat /srv/dotfiles-test/secret.env >> "$HOME/.config/hypr/leaked-key" || true\ncat /opt/dotfiles-test/secret.env /var/lib/dotfiles-test/secret.env "$HOME/.local/state/omarchy/toggles/secret.env" >> "$HOME/.config/hypr/leaked-key" || true\n' >/tmp/leaktree/migrations/1799999999.sh
+# This one swaps the action log for a symlink to a file only the host can see.
+printf 'echo "Swap the log"\nrm -f /tmp/of/log/actions.log\nln -s /home/dev/.netrc-test /tmp/of/log/actions.log\n' >/tmp/leaktree/migrations/1799999998.sh
+mkdir -p /var/lib/dotfiles-test && echo OUTSIDE-HOME-SECRET >/var/lib/dotfiles-test/secret.env && chmod -R a+rX /var/lib/dotfiles-test
 mkdir -p /srv/dotfiles-test && echo OUTSIDE-HOME-SECRET >/srv/dotfiles-test/secret.env && chmod -R a+rX /srv/dotfiles-test
 mkdir -p /opt/dotfiles-test && echo OUTSIDE-HOME-SECRET >/opt/dotfiles-test/secret.env && chmod -R a+rX /opt/dotfiles-test
 mkdir -p /tmp/leaktree/bin && ln -sfn /home/dev/.ssh/id_rsa /tmp/leaktree/bin/omarchy-leak
 chmod -R a+rX /tmp/leaktree
 as_dev 'mkdir -p -m700 ~/.ssh && echo SECRET-KEY-MATERIAL > ~/.ssh/id_rsa && chmod 600 ~/.ssh/id_rsa'
+as_dev 'printf "1799999998\\tNETRC-SECRET\\n1799999999\\tNETRC-SECRET\\n" > ~/.netrc-test && chmod 600 ~/.netrc-test'
 as_dev 'echo EXCLUDED-SECRET > ~/.config/hypr/secrets.env && mkdir -p ~/.config/omaforecast ~/.local/state/omarchy/toggles && echo EXCLUDED-SECRET > ~/.local/state/omarchy/toggles/secret.env && printf "%s\n" .config/hypr/secrets.env .local/state/omarchy/toggles/secret.env > ~/.config/omaforecast/exclude'
 as_dev 'omaforecast check --offline --no-snapshot --diff --from /tmp/leaktree' >/work/leak.txt 2>&1
 as_dev 'cat ~/.local/state/omaforecast/last-forecast.diff; cat ~/.local/state/omaforecast/sim-logs/* 2>/dev/null' >>/work/leak.txt
-grep -q 'Leak a key' /work/leak.txt && ! grep -qE 'SECRET-KEY-MATERIAL|EXCLUDED-SECRET|OUTSIDE-HOME-SECRET' /work/leak.txt && ok "private keys, excluded files and files outside home never reach the sandbox" || { cat /work/leak.txt; bad "private file reached the forecast"; }
-as_dev 'rm -rf ~/.ssh ~/.config/omaforecast ~/.config/hypr/secrets.env ~/.local/state/omarchy/toggles/secret.env'
+grep -q 'Leak a key' /work/leak.txt && ! grep -qE 'SECRET-KEY-MATERIAL|EXCLUDED-SECRET|OUTSIDE-HOME-SECRET|NETRC-SECRET' /work/leak.txt && ok "private keys, excluded files and files outside home never reach the sandbox" || { cat /work/leak.txt; bad "private file reached the forecast"; }
+as_dev 'rm -rf ~/.netrc-test ~/.ssh ~/.config/omaforecast ~/.config/hypr/secrets.env ~/.local/state/omarchy/toggles/secret.env'
 
 step "Static fallback without bubblewrap"
-as_dev 'OMAFORECAST_NO_SANDBOX=1 omaforecast check --offline --no-snapshot --from /work/fixtures/v2' >/work/static.txt 2>&1
+rc=0; as_dev 'OMAFORECAST_NO_SANDBOX=1 omaforecast check --offline --no-snapshot --from /work/fixtures/v2' >/work/static.txt 2>&1 || rc=$?
 grep -q 'mentions ~/.config/kitty/kitty.conf' /work/static.txt && ok "static mode names kitty.conf" || bad "static mode"
+((rc == 5)) && grep -q 'No forecast' /work/static.txt && ! grep -q 'leaves your config alone' /work/static.txt && ok "no sandbox: exit 5 and no forecast claimed" || bad "no sandbox must fail loudly (rc=$rc)"
 
 cp -r /home/dev/.local/state/omaforecast/sim-logs /work/ 2>/dev/null
 # Predicted set of changed user files (excluding Omarchy state)

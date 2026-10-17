@@ -106,14 +106,14 @@ This is the output from the [end-to-end test](#testing). Add `--diff` to print e
 Run `omarchy update` as usual, or `omaforecast update`, which asks before continuing if your customized files are affected. When the update finishes, the post-update hook prints a report. Here the pacman hook took a fresh snapshot just before the upgrade, so the report compares against that one.
 
 ```console
-omaforecast: what the update changed in your config (since 20261017-153423-pre-update)
+omaforecast: what the update changed in your config (since 20261017-191315-pre-update)
   added     ~/.config/fcitx5/conf/classicui.conf
   modified  ~/.config/kitty/kitty.conf
   modified  ~/.config/omarchy/shell.json
 
- See the diff:   omaforecast diff 20261017-153423-pre-update
- Undo all:       omaforecast restore 20261017-153423-pre-update
- Undo one file:  omaforecast restore 20261017-153423-pre-update ~/<path>
+ See the diff:   omaforecast diff 20261017-191315-pre-update
+ Undo all:       omaforecast restore 20261017-191315-pre-update
+ Undo one file:  omaforecast restore 20261017-191315-pre-update ~/<path>
 ```
 
 ### Undo one file
@@ -121,7 +121,7 @@ omaforecast: what the update changed in your config (since 20261017-153423-pre-u
 ```console
 $ omaforecast restore ~/.config/kitty/kitty.conf --yes
 
-Restore from snapshot 20261017-153423-pre-update (pre-update, 2026-10-17T15:34:23+00:00)
+Restore from snapshot 20261017-191315-pre-update (pre-update, 2026-10-17T19:13:17+00:00)
   put back   ~/.config/kitty/kitty.conf
 
 Restored 1 file(s). Undo with: omaforecast restore 20261017-145015-pre-restore
@@ -132,7 +132,7 @@ Restored 1 file(s). Undo with: omaforecast restore 20261017-145015-pre-restore
 ```console
 $ omaforecast restore --delete --yes
 
-Restore from snapshot 20261017-153423-pre-update (pre-update, 2026-10-17T15:34:23+00:00)
+Restore from snapshot 20261017-191315-pre-update (pre-update, 2026-10-17T19:13:17+00:00)
   remove     ~/.config/fcitx5/conf/classicui.conf
   put back   ~/.config/kitty/kitty.conf
   put back   ~/.config/omarchy/shell.json
@@ -157,7 +157,7 @@ Without `--delete`, files the update added stay in place and the restore lists t
 | `omaforecast setup` | Install the hook and menu rows. Options are `--pacman-hook`, `--menu-update`, `--no-menu`, and `--no-hook` |
 | `omaforecast uninstall [--purge]` | Remove everything setup added |
 
-`SNAPSHOT` is a snapshot id, part of one, `latest`, or `pre-update`. The default is the last pre-update snapshot. `check --exit-code` returns 3 when files you customized would be rewritten, and 4 when it couldn't save a snapshot, for use in scripts.
+`SNAPSHOT` is a snapshot id, part of one, `latest`, or `pre-update`. The default is the last pre-update snapshot. `check --exit-code` returns 3 when files you customized would be rewritten, and 4 when it couldn't save a snapshot, for use in scripts. It always returns 5 when the dry run couldn't start (no bubblewrap, or the system blocks user namespaces): then there is no forecast, and `omaforecast update` stops. `--no-sim` skips the dry run on purpose and only lists the files the migrations mention.
 
 ## How it works
 
@@ -177,7 +177,7 @@ Omarchy 4 ships as two pacman packages. `omarchy` has the commands, migrations, 
 
 1. It syncs a private copy of the package databases, the way `checkupdates` does, so the system's databases stay untouched. It downloads the new `omarchy` package to `~/.cache/omaforecast` and unpacks it. It checks the package's detached signature with `gpg`, against a copy of pacman's keyring and trust database, so the key must be one pacman would accept. A bad signature, or one from an unknown, untrusted, revoked or expired key, stops the check before any migration runs. A missing signature stops it when `pacman.conf` requires signed packages from that repo. `--allow-unsigned` overrides both. On the dev channel it uses the upstream branch of your `~/omarchy` checkout instead.
 2. It works out which migrations are pending for your user, the same way `omarchy-migrate` does.
-3. It runs the pending migrations one at a time, in order, in a bubblewrap sandbox. The new release is mounted over `/usr/share/omarchy` and its `omarchy-*` commands over `/usr/bin`. The sandbox has a throwaway home with your tracked config and Omarchy's per-user state. Only your tracked, non-excluded config goes into that home, so a migration can't read `~/.ssh` or other private files. Only `/usr`, `/etc` and `/var/lib` from the host are visible, read-only, so files elsewhere such as `/opt`, `/srv` or `/mnt` stay out. `/run` is empty and there is no network. Stubs replace `sudo`, `systemctl`, `pacman` (except queries), `hyprctl`, notifications and service restarts, and record what the migration tried to run.
+3. It runs the pending migrations one at a time, in order, in a bubblewrap sandbox. The new release is mounted over `/usr/share/omarchy` and its `omarchy-*` commands over `/usr/bin`. The sandbox has a throwaway home with your tracked config and Omarchy's per-user state. Only your tracked, non-excluded config goes into that home, so a migration can't read `~/.ssh` or other private files. Only `/usr`, `/etc` and pacman's database in `/var/lib/pacman` are visible from the host, read-only, so files elsewhere such as `/opt`, `/srv`, `/mnt` or the rest of `/var` stay out. Keep secrets out of world-readable files in `/etc`: a migration can read those. `/run` is empty and there is no network. Stubs replace `sudo`, `systemctl`, `pacman` (except queries), `hyprctl`, notifications and service restarts, and record what the migration tried to run.
 4. After each migration it diffs the throwaway home, so each change is tied to the migration that made it.
 5. It compares each changed file with the default your current release shipped. An identical file is "stock". A different one is "you customized this". A file with no shipped default is "your file".
 6. It also runs `pacman -Qkk` to find package files you edited by hand, which the upgrade will overwrite. It lists new upstream defaults for files you customized, which the update won't apply.
@@ -260,6 +260,9 @@ Yes. Snapshots save the file content behind each link, and a restore writes thro
 
 **Why did `check` stop with a signature error?**
 The package it downloaded didn't verify against pacman's keyring, or it had no signature and your `pacman.conf` requires one. pacman would refuse that package too. Run `sudo pacman -Sy` and try again. Use `--allow-unsigned` only if you know why the signature is missing.
+
+**Why did `check` stop with "bubblewrap can't create a sandbox"?**
+The dry run needs an unprivileged user namespace, and some systems block them (Ubuntu 24.04 does through AppArmor, and some hardened kernels turn them off). With no sandbox there is no forecast, so `check` exits with code 5 and `omaforecast update` stops instead of guessing. Allow user namespaces (on Ubuntu: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`), or run `omaforecast check --no-sim` to see only the files the migrations mention.
 
 **How much disk does it use?**
 A snapshot of a typical Omarchy config is a few megabytes. Files that didn't change are hardlinks to the previous snapshot, and omaforecast keeps the last 30. Set `OMAFORECAST_KEEP` to change that.

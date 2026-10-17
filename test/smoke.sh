@@ -176,6 +176,25 @@ printf 'echo "Write pwn"\nmkdir -p "$HOME/.config/hypr"; echo hi > "$HOME/.confi
 (cd "$t/cwd" && "$bin" check --offline --no-snapshot --from "$t/evtree" >"$t/ev.out" 2>&1)
 check "migration names with shell or sed syntax are skipped, not run" '[[ ! -e $t/cwd/PWNED && ! -e $HOME/PWNED ]] && grep -q "unexpected file name" "$t/ev.out"'
 
+# A find failure while listing files counts, even if a later pass succeeds.
+mkdir -p "$t/flakyfind" "$HOME/.config/hypr/sub"; echo keep >"$HOME/.config/hypr/sub/keep.conf"
+cat >"$t/flakyfind/find" <<FIND
+#!/bin/bash
+for a in "\$@"; do
+  if [[ \$a == .config/hypr && ! -e $t/flakyfind/once ]]; then
+    : >"$t/flakyfind/once"; echo "find: '.config/hypr/sub': Permission denied" >&2; exit 1
+  fi
+done
+exec $(command -v find) "\$@"
+FIND
+chmod +x "$t/flakyfind/find"; before=$(nsnaps)
+PATH=$t/flakyfind:$PATH "$bin" snapshot flaky --quiet >"$t/flaky.out" 2>&1; rc=$?
+check "H1 a find failure in the file listing fails the snapshot" '((rc != 0)) && [[ $(nsnaps) == "$before" ]] && grep -q "hypr/sub" "$t/flaky.out"'
+rm -f "$t/flakyfind/once"; mkdir -p "$HOME/.config/omaforecast"; echo .config/hypr/sub >"$HOME/.config/omaforecast/exclude"
+PATH=$t/flakyfind:$PATH "$bin" snapshot flaky2 --quiet >/dev/null 2>&1; rc=$?
+check "H1 excluding the path that find couldn't list lets the snapshot succeed" '((rc == 0))'
+rm -rf "$HOME/.config/omaforecast" "$HOME/.config/hypr/sub" "$t/flakyfind"
+
 # An exclude list that can't be read stops omaforecast instead of being ignored.
 if (($(id -u) != 0)); then
   mkdir -p "$HOME/.config/omaforecast"; echo .config/hypr/secret >"$HOME/.config/omaforecast/exclude"; chmod 000 "$HOME/.config/omaforecast/exclude"
@@ -191,6 +210,21 @@ if (($(id -u) != 0)); then
   check "an exclude list in an unsearchable folder stops omaforecast" '((rc != 0))'
   rm -rf "$HOME/.config/omaforecast"
 fi
+# The exclude-list check looks at the error, not at text in the path.
+if (($(id -u) != 0)); then
+  odd="$t/No such file or directory/locked"; mkdir -p "$odd" "$t/tree/migrations"; echo 'echo "Touch kitty"' >"$t/tree/migrations/1700000000.sh"; echo .config/hypr/secret >"$odd/exclude"; chmod 000 "$odd"
+  OMAFORECAST_CONFIG=$odd "$bin" check --offline --no-snapshot --no-sim --from "$t/tree" >/dev/null 2>&1; rc=$?
+  chmod 700 "$odd"
+  check "an exclude list behind an odd, unsearchable path stops omaforecast" '((rc != 0))'
+fi
+# An unreadable folder that you excluded doesn't stop the snapshot.
+if (($(id -u) != 0)); then
+  mkdir -p "$HOME/.config/hypr/locked" "$HOME/.config/omaforecast"; echo x >"$HOME/.config/hypr/locked/f"; chmod 000 "$HOME/.config/hypr/locked"
+  echo .config/hypr/locked >"$HOME/.config/omaforecast/exclude"
+  "$bin" snapshot lockedok --quiet >"$t/lk.out" 2>&1; rc=$?
+  chmod 700 "$HOME/.config/hypr/locked"; rm -rf "$HOME/.config/hypr/locked" "$HOME/.config/omaforecast"
+  check "an excluded unreadable folder doesn't stop the snapshot" '((rc == 0))' || cat "$t/lk.out"
+fi
 # An incoming tree whose bin/ links outside it is refused.
 mkdir -p "$t/linktree/migrations" "$t/fake-ssh2"; echo key >"$t/fake-ssh2/omarchy-prod"; ln -s "$t/fake-ssh2" "$t/linktree/bin"
 echo 'echo "x"' >"$t/linktree/migrations/1700000001.sh"
@@ -204,6 +238,20 @@ check "H6 state dir is 700" '[[ $(stat -c %a "$HOME/.local/state/omaforecast") =
 check "H6 snapshot dirs are private" '[[ $(stat -c %a "$S/$id6") == 700 ]]'
 check "H6 forecast diff is 600" '[[ $(stat -c %a "$HOME/.local/state/omaforecast/last-forecast.diff") == 600 ]]'
 check "H6 saved files keep their own mode" '[[ $(stat -c %a "$S/$id6/files/.config/hypr/bindings.lua") == 644 ]] || [[ $(stat -c %a "$S/$id6/files/.config/hypr/bindings.lua") == $(stat -c %a "$t/dots/hypr/bindings.lua") ]]'
+
+# A sandbox that can't be created is an error, never an empty forecast.
+mkdir -p "$t/nobwrap"; printf '#!/bin/sh\necho "bwrap: No permissions to create new namespace" >&2\nexit 1\n' >"$t/nobwrap/bwrap"; chmod +x "$t/nobwrap/bwrap"
+PATH=$t/nobwrap:$PATH "$bin" check --offline --no-snapshot --from "$t/tree" >"$t/nb.out" 2>&1; rc=$?
+check "a sandbox that can't start fails the check (exit 5)" '((rc == 5))'
+check "a sandbox that can't start says why and makes no forecast" 'grep -q "can.t create a sandbox" "$t/nb.out" && grep -q "No forecast" "$t/nb.out" && ! grep -qE "leaves your config alone|None of your customizations" "$t/nb.out"'
+OMAFORECAST_SIM_TIMEOUT=soon "$bin" check --offline --no-snapshot --from "$t/tree" >"$t/nb5.out" 2>&1; rc=$?
+check "a bad dry-run timeout fails the check (exit 5)" '((rc == 5)) && grep -q "OMAFORECAST_SIM_TIMEOUT" "$t/nb5.out"'
+OMAFORECAST_NO_SANDBOX=1 "$bin" check --offline --no-snapshot --from "$t/tree" >"$t/nb2.out" 2>&1; rc=$?
+check "no bubblewrap also fails the check (exit 5)" '((rc == 5)) && grep -q "No forecast" "$t/nb2.out"'
+PATH=$t/nobwrap:$PATH "$bin" check --offline --no-snapshot --no-sim --from "$t/tree" >"$t/nb3.out" 2>&1; rc=$?
+check "--no-sim skips the dry run on purpose and says so" '((rc == 0)) && grep -q "Dry run skipped" "$t/nb3.out"'
+rc=$(OMAFORECAST_SOURCED=1 bash -c '. "$1"; cmd_check() { return 5; }; omarchy-update() { echo RAN; }; cmd_update -y; echo "rc=$?"' _ "$bin" 2>&1)
+check "update stops when the forecast fails" '[[ $rc == *rc=5* && $rc != *RAN* ]]'
 
 # H7: a bad or missing signature stops the forecast.
 echo 'package' >"$t/pkg.tar"; echo 'not a signature' >"$t/pkg.tar.sig"

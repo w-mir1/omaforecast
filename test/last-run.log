@@ -39,7 +39,7 @@ Pending migrations: 6 (they run as you, right after the packages install)
 
  ✗ 1788745941  Update Kitty configuration
      would modify ~/.config/kitty/kitty.conf [you customized this]
-     keeps a backup at ~/.config/kitty/kitty.conf.bak.UdIxrG
+     keeps a backup at ~/.config/kitty/kitty.conf.bak.s7m0ol
 
  ✗ 1791968925  Write the bar's tray where the bar drew it
      would modify ~/.config/omarchy/shell.json [you customized this]
@@ -71,7 +71,7 @@ New Omarchy defaults you won't get automatically
 Summary
  2 file(s) you changed would be rewritten. Also: 0 stock, 1 new.
  Full diff: omaforecast check --diff  (saved to ~/.local/state/omaforecast/last-forecast.diff)
- Snapshot saved: 20261017-153419-pre-update
+ Snapshot saved: 20261017-191311-pre-update
  After the update, undo it with: omaforecast restore  (or one file: omaforecast restore <path>)
 PASS: found incoming release from the repo
 PASS: 6 pending migrations
@@ -92,6 +92,7 @@ PASS: private keys, excluded files and files outside home never reach the sandbo
 
 ### Static fallback without bubblewrap
 PASS: static mode names kitty.conf
+PASS: no sandbox: exit 5 and no forecast claimed
 PASS: notes the .bak the kitty migration writes
 PASS: summary counts 2 distinct customized files
 
@@ -101,14 +102,14 @@ upgrading omarchy...
 PASS: pacman hook ran before the upgrade
 omarchy-migrate exit: 0
 
-omaforecast: what the update changed in your config (since 20261017-153423-pre-update)
+omaforecast: what the update changed in your config (since 20261017-191315-pre-update)
   added     ~/.config/fcitx5/conf/classicui.conf
   modified  ~/.config/kitty/kitty.conf
   modified  ~/.config/omarchy/shell.json
 
- See the diff:   omaforecast diff 20261017-153423-pre-update
- Undo all:       omaforecast restore 20261017-153423-pre-update
- Undo one file:  omaforecast restore 20261017-153423-pre-update ~/<path>
+ See the diff:   omaforecast diff 20261017-191315-pre-update
+ Undo all:       omaforecast restore 20261017-191315-pre-update
+ Undo one file:  omaforecast restore 20261017-191315-pre-update ~/<path>
 predicted:
 ~/.config/fcitx5/conf/classicui.conf
 ~/.config/kitty/kitty.conf
@@ -122,13 +123,13 @@ PASS: update did rewrite kitty.conf (as forecast)
 
 ### omaforecast restore (one command rollback)
 
-Restore from snapshot 20261017-153423-pre-update (pre-update, 2026-10-17T15:34:23+00:00)
+Restore from snapshot 20261017-191315-pre-update (pre-update, 2026-10-17T19:13:17+00:00)
   remove     ~/.config/fcitx5/conf/classicui.conf
   put back   ~/.config/kitty/kitty.conf
   keep       ~/.config/nvim/lua/new-plugin.lua (inside the symlinked ~/.config/nvim; omaforecast never deletes through a symlink)
   put back   ~/.config/omarchy/shell.json
 
-Restored 3 file(s). Undo with: omaforecast restore 20261017-153426-pre-restore
+Restored 3 file(s). Undo with: omaforecast restore 20261017-191320-pre-restore
 Restart the Omarchy shell to pick up shell.json changes: omarchy-restart-shell
 PASS: restore --delete never deletes through the stowed nvim link
 PASS: and says why it kept it
@@ -150,4 +151,4 @@ removed snapshots and cache
 removed ~/.local/bin/omaforecast
 PASS: uninstall clean, user menu entries kept
 
-RESULT: 37 passed, 0 failed
+RESULT: 38 passed, 0 failed

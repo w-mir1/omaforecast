@@ -10,7 +10,7 @@ set -uo pipefail
 # Snapshots, diffs and logs can hold secrets from your config: keep them private.
 umask 077
 
-VERSION=0.1.0
+VERSION=0.1.1
 PROG=omaforecast
 
 OMARCHY_PATH=${OMARCHY_PATH:-/usr/share/omarchy}
@@ -137,8 +137,10 @@ excluded() {
 USER_EXCLUDE=()
 # Tell "no exclude list" apart from "can't see whether there is one", such as
 # when ~/.config/omaforecast itself can't be searched.
+# Only the reason after the last ": " counts; the path itself could contain
+# any text.
 if ! _ex=$(LC_ALL=C stat -c %n -- "$OF_CONF/exclude" 2>&1 >/dev/null) &&
-  [[ $_ex != *"No such file or directory"* && $_ex != *"Not a directory"* ]]; then
+  [[ ${_ex##*: } != "No such file or directory" && ${_ex##*: } != "Not a directory" ]]; then
   printf '%s: %s\n' "$PROG" "can't check ${OF_CONF/#$HOME/\~}/exclude; fix the folder's permissions" >&2; exit 1
 fi
 if [[ -e $OF_CONF/exclude || -L $OF_CONF/exclude ]]; then
@@ -152,15 +154,23 @@ fi
 
 # list_files ROOT: tracked regular files under ROOT (a $HOME or a copy of it),
 # relative paths, one per line. Follows symlinks so stow/chezmoi setups are
-# captured by content.
+# captured by content. With LF_BLIND set, every path find couldn't list is
+# appended to that file (so a failure can't be hidden by a later success), and
+# a failed write makes list_files fail.
 list_files() {
-  local root=$1 p f
+  local root=$1 p f errf=/dev/null
+  local -
+  set -o pipefail
+  [[ -n ${LF_BLIND:-} ]] && errf=$LF_BLIND.err
   { if [[ -n ${SCOPE_FILE:-} ]]; then cat "$SCOPE_FILE"; else scope_entries; fi; } | sort -u | while IFS= read -r p; do
     [[ -n $p && -e $root/$p ]] || continue
     if [[ -d $root/$p ]]; then
-      (cd "$root" && find -L "$p" \( -name .git -o -name node_modules \
+      if (cd "$root" && LC_ALL=C find -L "$p" \( -name .git -o -name node_modules \
         -o -path .config/omarchy/plugins -o -path .config/omarchy/current \) -prune \
-        -o -type f -size -50M -print 2>/dev/null)
+        -o -type f -size -50M -print 2>"$errf"); then :
+      elif [[ -n ${LF_BLIND:-} ]]; then
+        { sed -n "s/^find: '\(.*\)': .*/\1/p" "$LF_BLIND.err" | grep . || printf '%s\n' "$p"; } >>"$LF_BLIND" || exit 1
+      fi
     else
       printf '%s\n' "$p"
     fi
@@ -296,14 +306,18 @@ snap_coverage() {
         # find names each path it couldn't read or list: find: 'PATH': reason
         { sed -n "s/^find: '\(.*\)': .*/\1/p" "$dir/find.err" | grep . || printf '%s\n' "$p"; } >>"$dir/blind" || err=1
       fi
-      (cd "$root" && find -L "$p" \( -name .git -o -name node_modules \) -prune -o -xtype l -print 2>/dev/null) |
-        while IFS= read -r l; do printf '%s\t%s\t%s\n' "$l" "$(readlink -- "$root/$l")" "$(realpath -m -- "$root/$l")" || exit 1; done >>"$dir/links.tmp" || err=1
+      # A folder this pass can't list is blind too (and so can be excluded);
+      # it is not a reason to fail by itself.
+      if ! (cd "$root" && LC_ALL=C find -L "$p" \( -name .git -o -name node_modules \) -prune -o -xtype l -print 2>"$dir/find.err") >"$dir/xlinks"; then
+        { sed -n "s/^find: '\(.*\)': .*/\1/p" "$dir/find.err" | grep . || printf '%s\n' "$p"; } >>"$dir/blind" || err=1
+      fi
+      while IFS= read -r l; do printf '%s\t%s\t%s\n' "$l" "$(readlink -- "$root/$l")" "$(realpath -m -- "$root/$l")" || { err=1; break; }; done <"$dir/xlinks" >>"$dir/links.tmp" || err=1
     else
       printf '%s\n' "$p" >>"$dir/exists" || err=1
     fi
   done <"$dir/scope"
   ((err == 0)) || return 1
-  sort -u "$dir/links.tmp" >"$dir/links" && rm -f "$dir/links.tmp" "$dir/find.err" "$dir/scope.raw" &&
+  sort -u "$dir/links.tmp" >"$dir/links" && rm -f "$dir/links.tmp" "$dir/find.err" "$dir/xlinks" "$dir/scope.raw" &&
     sort -u -o "$dir/blind" "$dir/blind" && sort -u -o "$dir/exists" "$dir/exists"
 }
 
@@ -337,7 +351,8 @@ cmd_snapshot() {
   local fail="could not save snapshot; nothing was published"
   # Read the scope once, and fail if any part of it (the include list) can't be read.
   scope_entries >"$dir/scope.raw" || snap_die "$fail (couldn't read $(tilde "$OF_CONF/include"))"
-  SCOPE_FILE=$dir/scope.raw list_files "$HOME" >"$dir/wanted.raw" || snap_die "$fail (couldn't write the file list)"
+  : >"$dir/list.blind" || snap_die "$fail (couldn't write the file list)"
+  SCOPE_FILE=$dir/scope.raw LF_BLIND=$dir/list.blind list_files "$HOME" >"$dir/wanted.raw" || snap_die "$fail (couldn't write the file list)"
   if [[ -n ${OF_EXTRA_FILES:-} && -f $OF_EXTRA_FILES ]]; then
     cat -- "$OF_EXTRA_FILES" >>"$dir/wanted.raw" || snap_die "$fail (couldn't write the file list)"
   fi
@@ -364,6 +379,13 @@ cmd_snapshot() {
   done <"$dir/manifest"
   [[ -s $dir/unreadable ]] && warn "$(wc -l <"$dir/unreadable") file(s) couldn't be read and are not in this snapshot (listed in $(tilde "$SNAPDIR/$id/unreadable"))"
   snap_coverage "$HOME" "$dir" || snap_die "$fail (couldn't record what was covered)"
+  # Paths the file listing couldn't see count as blind too, even if the
+  # coverage pass later could, so the two passes can't disagree silently.
+  if [[ -s $dir/list.blind ]]; then
+    sort -u "$dir/blind" "$dir/list.blind" >"$dir/blind.new" && mv -f -- "$dir/blind.new" "$dir/blind" ||
+      snap_die "$fail (couldn't record what was covered)"
+  fi
+  rm -f -- "$dir/list.blind" "$dir/list.blind.err"
   # A directory that can't be listed would leave files out of the snapshot
   # without anyone noticing. Fail instead, unless the user excluded it.
   local b bad=()
@@ -968,12 +990,17 @@ copy_new_bins() {
 SIM_OK=0 SIM_NOTE=""
 simulate() { # simulate WORK MIGRATIONS...   fills $WORK/result/<mig>.changes
   local work=$1; shift
-  if [[ -n ${OMAFORECAST_NO_SANDBOX:-} ]] || ! have bwrap; then
-    SIM_NOTE="bubblewrap (bwrap) not installed, so migrations were read but not dry-run. Install it with: sudo pacman -S bubblewrap"
+  if ! [[ $SIM_TIMEOUT =~ ^[0-9]+(\.[0-9]+)?[smhd]?$ ]]; then
+    SIM_NOTE="OMAFORECAST_SIM_TIMEOUT must be a duration such as 120 or 5m, not '$SIM_TIMEOUT'"
     return 1
   fi
-  if ! bwrap --ro-bind / / --unshare-all --die-with-parent true 2>/dev/null; then
-    SIM_NOTE="bubblewrap can't create a sandbox here (user namespaces disabled?), so migrations were read but not dry-run"
+  if [[ -n ${OMAFORECAST_NO_SANDBOX:-} ]] || ! have bwrap; then
+    SIM_NOTE="bubblewrap (bwrap) isn't installed. Install it with: sudo pacman -S bubblewrap"
+    return 1
+  fi
+  local berr
+  if ! berr=$(bwrap --ro-bind / / --unshare-all --die-with-parent true 2>&1); then
+    SIM_NOTE="bubblewrap can't create a sandbox here (user namespaces disabled?)${berr:+: ${berr%%$'\n'*}}"
     return 1
   fi
 
@@ -1026,7 +1053,8 @@ simulate() { # simulate WORK MIGRATIONS...   fills $WORK/result/<mig>.changes
         if [[ -L $e ]]; then args+=(--symlink "$(readlink "$e")" "$e"); elif [[ -d $e ]]; then args+=(--ro-bind "$e" "$e"); fi ;;
     esac
   done
-  [[ -d /var/lib ]] && args+=(--ro-bind /var/lib /var/lib)
+  # pacman's database, for the queries migrations make. Nothing else in /var.
+  [[ -d /var/lib/pacman ]] && args+=(--ro-bind /var/lib/pacman /var/lib/pacman)
   args+=(--dev /dev --proc /proc --tmpfs /tmp --tmpfs /var/tmp --tmpfs /run)
   args+=(--ro-bind "$work" /tmp/of --bind "$work/log" /tmp/of/log)
   local b
@@ -1067,6 +1095,14 @@ simulate() { # simulate WORK MIGRATIONS...   fills $WORK/result/<mig>.changes
     sim_changes "$prev" "$work/l.old" "$home" "$work/l.new" | M=${m%.sh} awk '{print ENVIRON["M"] "\t" $0}' >"$work/result/$m.changes"
     prev=$work/state.$i; cp -a "$home" "$prev"
   done
+  # The sandbox could write to the log folder, so take the log only if it is
+  # still a plain file. A symlink there could point at any of your files.
+  if [[ -f $work/log/actions.log && ! -L $work/log/actions.log ]]; then
+    mv -f -- "$work/log/actions.log" "$work/actions.log" || : >"$work/actions.log"
+  else
+    warn "a migration replaced the dry run's action log; ignoring it"
+    : >"$work/actions.log"
+  fi
   SIM_OK=1
 }
 
@@ -1119,14 +1155,19 @@ cmd_check() {
   local diffs=$OF_STATE/last-forecast.diff
   mkdir -p "$OF_STATE" && chmod 700 "$OF_STATE" "$OF_CACHE"; : >"$diffs"; chmod 600 "$diffs"
 
-  local n_cust=0 n_stock=0 n_your=0 n_new=0 n_fail=0
+  local n_cust=0 n_stock=0 n_your=0 n_new=0 n_fail=0 SIM_FAILED=0
   local -A HIT=()
   if ((${#pend[@]} == 0)); then
     hdr "${G}✓ No pending migrations.${N} The update will install packages but won't run anything against your config."
   else
     say "Pending migrations: ${B}${#pend[@]}${N} (they run as you, right after the packages install)"
     ((sim)) && simulate "$work" "${pend[@]}"
-    ((SIM_OK)) || { [[ -n $SIM_NOTE ]] && warn "$SIM_NOTE"; ((sim)) || true; }
+    # A dry run that couldn't start is an error, never an empty forecast.
+    if ((sim && !SIM_OK)); then
+      SIM_FAILED=1
+      printf '%s%s: error:%s %s\n' "$R" "$PROG" "$N" "${SIM_NOTE:-the dry run did not start}" >&2
+      printf '%s%s:%s %s\n' "$R" "$PROG" "$N" "No forecast was made. Below is only what the migrations mention, not what they would change." >&2
+    fi
 
     local m desc rc ch cls s f mid idx=0
     for m in "${pend[@]}"; do
@@ -1154,7 +1195,7 @@ cmd_check() {
           show_diff_into "$work" "$idx" "$m" "$f" >>"$diffs"
         done <"$ch"
         if ((!own)) && [[ $rc == 0 ]]; then printf '     %sno changes to your config%s\n' "$D" "$N"; fi
-        local acts; acts=$(awk -F'\t' -v m="$mid" '$1==m{print $2}' "$work/log/actions.log" | sort -u | grep -vE '^(gum (style|format|spin)|pacman -Q)' | head -6)
+        local acts; acts=$(awk -F'\t' -v m="$mid" '$1==m{print $2}' "$work/actions.log" | sort -u | grep -vE '^(gum (style|format|spin)|pacman -Q)' | head -6)
         [[ -n $acts ]] && printf '     %salso wants to run:%s\n%s\n' "$D" "$N" "$(sed 's/^/       /' <<<"$acts" | cut -c1-96)"
         mkdir -p "$OF_STATE/sim-logs" && chmod 700 "$OF_STATE/sim-logs"; cp "$work/result/$m.out" "$OF_STATE/sim-logs/$mid.log"; chmod 600 "$OF_STATE/sim-logs/$mid.log"
         if [[ $rc != 0 ]]; then
@@ -1192,6 +1233,12 @@ cmd_check() {
       say " ${G}This update leaves your config alone.${N}"
     fi
     [[ -s $diffs ]] && say " Full diff: ${C}$PROG check --diff${N}  (saved to $(tilde "$diffs"))"
+  elif ((SIM_FAILED)); then
+    say " ${R}No forecast: the dry run couldn't start.${N} ${SIM_NOTE}"
+    say " Nothing above says your config is safe. Fix the sandbox and run ${C}$PROG check${N} again,"
+    say " or use ${C}$PROG check --no-sim${N} for the list of files the migrations mention."
+  elif ((${#pend[@]})); then
+    say " ${Y}Dry run skipped (--no-sim).${N} The list above is what the migrations mention, not a forecast."
   fi
   if ((snapshot)); then
     printf '%s\n' "${!HIT[@]}" | grep -v '^$' >"$work/hit" || true
@@ -1205,6 +1252,7 @@ cmd_check() {
     fi
   fi
   if ((show)) && [[ -s $diffs ]]; then hdr "Diffs"; cat "$diffs"; fi
+  ((SIM_FAILED)) && return 5
   ((exitcode && n_cust + n_your > 0)) && return 3
   return 0
 }
