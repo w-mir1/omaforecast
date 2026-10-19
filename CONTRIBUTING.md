@@ -1,16 +1,14 @@
 # Contributing
 
-Bug reports, wrong forecasts, and pull requests are welcome.
+Public pull requests and issues are limited to collaborators for now.
 
-## Reporting a wrong forecast
-
-A forecast is wrong when `omaforecast check` predicted different file changes than `omaforecast report` showed after the update. Open an issue with the output of both commands, the matching `~/.local/state/omaforecast/reports/omarchy_update_details_*_UTC*.diff`, and any logs in `~/.local/state/omaforecast/sim-logs/`. Check those files for anything private before you attach them.
+Wrong forecasts are still the most useful feedback. If `omaforecast check` predicted different file changes than `omaforecast report` showed after the update, contact [@w_mir01](https://x.com/w_mir01) with the output of both commands, the matching `~/.local/state/omaforecast/reports/omarchy_update_details_*_UTC*.diff`, and any logs in `~/.local/state/omaforecast/sim-logs/` (strip anything private first).
 
 ## Development
 
 omaforecast is one bash script, `bin/omaforecast`. It needs bash, coreutils, find, tar, and diff or git. The dry run also needs bubblewrap.
 
-Run the checks before you open a pull request:
+Run the checks before opening a pull request (collaborators):
 
 ```bash
 shellcheck -S warning bin/omaforecast install.sh test/*.sh
