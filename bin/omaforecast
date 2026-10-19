@@ -232,9 +232,21 @@ under_any() {
 # --------------------------------------------------------------- versions ---
 
 omarchy_version() {
-  if have omarchy-version; then omarchy-version 2>/dev/null && return; fi
-  pacman -Q omarchy 2>/dev/null | awk '{print $2}' && return
-  [[ -f $OMARCHY_PATH/version ]] && cat "$OMARCHY_PATH/version" && return
+  local v p
+  if have omarchy-version; then
+    v=$(omarchy-version 2>/dev/null) || v=""
+    case ${v,,} in '' | unknown | *alpha* | *placeholder*) ;; *) echo "$v"; return ;; esac
+  fi
+  if have pacman; then
+    for p in omarchy omarchy-dev omarchy-settings omarchy-settings-dev; do
+      v=$(pacman -Q "$p" 2>/dev/null | awk '{print $2}') || v=""
+      [[ -n $v ]] && { echo "$v"; return; }
+    done
+  fi
+  if [[ -f $OMARCHY_PATH/version ]]; then
+    v=$(cat "$OMARCHY_PATH/version") || v=""
+    case ${v,,} in '' | unknown | *alpha* | *placeholder*) ;; *) echo "$v"; return ;; esac
+  fi
   echo unknown
 }
 
@@ -746,11 +758,17 @@ fetch_incoming() {
     if ((${#pkgs[@]})); then
       mkdir -p "$db"
       ln -sfn /var/lib/pacman/local "$db/local"
-      local synced=0
+      local synced=0 sync_rc
       if have fakeroot; then
         fakeroot -- pacman -Sy --dbpath "$db" --logfile /dev/null >/dev/null 2>&1 && synced=1
+        ((synced)) || FETCH_NOTE+="${FETCH_NOTE:+; }private package database sync failed (fakeroot/pacman); trying upstream source"
       elif have checkupdates; then
-        CHECKUPDATES_DB=$db checkupdates >/dev/null 2>&1; [[ -d $db/sync ]] && synced=1
+        CHECKUPDATES_DB=$db checkupdates >/dev/null 2>&1; sync_rc=$?
+        # checkupdates returns 2 when the sync succeeded but nothing is newer.
+        if ((sync_rc == 0 || sync_rc == 2)) && [[ -d $db/sync ]]; then synced=1
+        else FETCH_NOTE+="${FETCH_NOTE:+; }private package database sync failed (checkupdates); trying upstream source"; fi
+      else
+        FETCH_NOTE+="${FETCH_NOTE:+; }could not sync a private package database (needs fakeroot or pacman-contrib); trying upstream source"
       fi
       if ((synced)); then
         local any=0 cur new url
@@ -780,10 +798,45 @@ fetch_incoming() {
           return 0
         fi
         NEW_DESC="no newer Omarchy package (${pkgs[*]} up to date)"
-      else
-        FETCH_NOTE="could not sync a private package database (needs fakeroot or pacman-contrib); checked what's on disk only"
       fi
     fi
+  fi
+
+  # Mirrors can lag a release. Prefer a release tag over the larger branch
+  # archive; the root version file is only a development placeholder.
+  if ((!offline)); then
+    if have curl && have tar; then
+      local api=https://api.github.com/repos/omacom/omarchy
+      local source=https://codeload.github.com/omacom/omarchy/tar.gz
+      local tags tag ref label sha=""
+      tags=$(curl -fsSL --connect-timeout 10 --max-time 30 "$api/tags?per_page=100" 2>/dev/null) || tags=""
+      tag=$(sed -nE 's/^[[:space:]]*"name"[[:space:]]*:[[:space:]]*"(v[0-9]+\.[0-9]+\.[0-9]+)"[[:space:]]*,?[[:space:]]*$/\1/p' <<<"$tags" | sort -Vr | head -1)
+      if [[ -n $tag ]]; then
+        ref=refs/tags/$tag; label=$tag
+      else
+        FETCH_NOTE+="${FETCH_NOTE:+; }could not resolve an upstream release tag; trying quattro branch tip"
+        ref=refs/heads/quattro; label="quattro (branch tip)"
+        sha=$(curl -fsSL --connect-timeout 10 --max-time 30 "$api/commits/quattro" 2>/dev/null) || sha=""
+        sha=$(sed -nE 's/^[[:space:]]*"sha"[[:space:]]*:[[:space:]]*"([0-9a-f]{40})",?[[:space:]]*$/\1/p' <<<"$sha" | head -1)
+        # Pin the archive to the commit we describe, when the API is available.
+        [[ -n $sha ]] && { ref=$sha; label="quattro @ ${sha:0:7}"; }
+      fi
+      local tree=$inc/source
+      mkdir -p "$tree"
+      if curl -fsSL --connect-timeout 10 --max-time 300 "$source/$ref" 2>/dev/null |
+        tar -xz --strip-components=1 -C "$tree" 2>/dev/null; then
+        if use_tree "$tree"; then
+          NEW_DESC="omacom/omarchy $label (upstream source)"
+          PKG_SIG="source archive over HTTPS; no pacman package signature"
+          return 0
+        fi
+      fi
+      FETCH_NOTE+="${FETCH_NOTE:+; }could not download or unpack upstream Omarchy source; checked what's on disk only"
+    else
+      FETCH_NOTE+="${FETCH_NOTE:+; }upstream source lookup needs curl and tar; checked what's on disk only"
+    fi
+  else
+    FETCH_NOTE+="${FETCH_NOTE:+; }offline: checked what's on disk only"
   fi
 
   # Nothing newer: migrations already on disk may still be pending (for
