@@ -291,7 +291,7 @@ The last run's output is in [test/last-run.log](test/last-run.log). CI runs shel
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Wrong forecasts are the most useful bug reports.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Public issues and PRs are collaborators-only for now; wrong forecasts are still the most useful feedback (reach out on X: [@w_mir01](https://x.com/w_mir01)).
 
 ## License
 
