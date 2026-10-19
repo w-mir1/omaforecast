@@ -2,10 +2,19 @@
 
 All notable changes to this project are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] - 2026-10-19
+
+### Added
+
+- `check` now prints a short migration summary and attention lines, with complete private Markdown reports in `reports/omarchy_update_details_<YYMMDD>_<HH>_<MM>_UTC.md` and an atomic `last-forecast.md` copy. Names use the check's start time in UTC, reserve collision suffixes atomically, and retain the newest 20 reports (`OMAFORECAST_KEEP_REPORTS`). `--verbose`, `--full`, and `-v` restore full terminal details; `--quiet` still saves a report.
+- Animated progress on stderr covers fetching, sandbox preparation, migrations with an ETA, and snapshots. `OMAFORECAST_PROGRESS=0` disables it and `=1` forces it for scripts or tests.
+- `self-update` (also `upgrade` and `update --self`) validates and atomically updates omaforecast, with check-only, force and yes options, while preserving hook and menu choices.
+- Interactive commands show an update-available notice from a daily cache refreshed in the background. `OMAFORECAST_NO_UPDATE_CHECK=1` disables it.
 
 ### Fixed
 
+- Report rendering no longer fails under UTF-8 locales such as `en_US.UTF-8` (GNU sed rejected the byte ranges used to strip terminal escapes; they now run with `LC_ALL=C`).
+- The sandbox self-test now uses the same `/proc`, `/dev` and `/tmp` mounts as the real dry runs, so a host where bubblewrap can't mount `/proc` gets a clear "can't create a sandbox" error (exit 5) instead of every migration showing as "dry run didn't finish".
 - `check` now falls back to the newest `omacom/omarchy` release tag (or the `quattro` branch tip if no tag resolves) when git and package lookup find no incoming release. It identifies the source version, reports failed package database syncs, and respects `--offline`.
 - Installed version detection now checks the edge and settings packages and ignores development placeholder version files.
 
@@ -48,5 +57,6 @@ First release.
 - An exclude list that can't be read, or sits in a folder that can't be searched, stops omaforecast instead of being ignored. Excludes also apply to the Omarchy state copied into the sandbox.
 - An end-to-end test builds real pacman packages from Omarchy source and checks the forecast against the real update. A smoke test runs without root or Docker.
 
+[0.2.0]: https://github.com/w-mir1/omaforecast/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/w-mir1/omaforecast/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/w-mir1/omaforecast/releases/tag/v0.1.0

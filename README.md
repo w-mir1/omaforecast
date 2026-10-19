@@ -31,7 +31,7 @@ omaforecast does three things:
 - **Snapshot.** It saves your Omarchy config before every update.
 - **Rollback.** `omaforecast restore` puts back everything the update changed, or one file. It saves a snapshot first, so you can undo the restore too.
 
-It is one bash script. It needs no root, and the dry run uses bubblewrap.
+Current release: **0.2.0**. It is one bash script. It needs no root, and the dry run uses bubblewrap.
 
 ## Install
 
@@ -47,7 +47,23 @@ Optional. To snapshot automatically before every Omarchy upgrade, including one 
 omaforecast setup --pacman-hook
 ```
 
-The dry run uses [bubblewrap](https://github.com/containers/bubblewrap). Without it, omaforecast reads the migrations and lists the files they name. Install it with `sudo pacman -S bubblewrap`.
+The dry run uses [bubblewrap](https://github.com/containers/bubblewrap). Without it, omaforecast records static file mentions in the full report and exits 5 because no dry run was possible. Use `--no-sim` to request static details explicitly. Install it with `sudo pacman -S bubblewrap`.
+
+## Updating omaforecast
+
+`omaforecast update` updates Omarchy with a forecast first. To update the omaforecast tool itself:
+
+```bash
+omaforecast self-update             # confirm and install the latest version
+omaforecast self-update --check     # exit 10 if newer, 0 if up to date
+omaforecast self-update --yes       # install without a prompt
+```
+
+`upgrade` and `update --self` are aliases. `--force` reinstalls the same version or allows a downgrade. The download is checked before an atomic replacement, then setup refreshes your existing hook and menu choices. Git checkouts should use `git pull`. The optional pacman hook has a separate system copy; refresh it with `omaforecast setup --pacman-hook` after updating.
+
+Interactive commands show a notice when a newer version is cached. The latest version comes from the script's `VERSION=` line and is cached in `~/.cache/omaforecast/latest-version` (or `$OMAFORECAST_CACHE/latest-version` / `$XDG_CACHE_HOME/omaforecast/latest-version`). Missing or stale data refreshes in the background, so a command never waits for the network. Checks happen at most once a day, including failed attempts; `OMAFORECAST_UPDATE_CHECK_INTERVAL` changes the interval in seconds.
+
+Set `OMAFORECAST_NO_UPDATE_CHECK=1` to disable both notices and background checks. Non-interactive commands, CI, root, hooks, `--offline`, and quiet commands also skip them. `OMAFORECAST_REPO` (default `w-mir1/omaforecast`) and `OMAFORECAST_REF` (default `main`) select the source for both self-updates and notices, using the same variables as the installer. `OMAFORECAST_RAW_BASE` overrides the raw host for mirrors or local testing (`file://`, `http://`, or `https://`).
 
 ## Quick start
 
@@ -57,49 +73,27 @@ The dry run uses [bubblewrap](https://github.com/containers/bubblewrap). Without
 $ omaforecast check
 
 omaforecast: what will the next Omarchy update do to your config?
-Looking for the incoming release…
-Incoming: omarchy 4.0.3-1 → 4.0.4-1 (signature not checked: no signature published; pacman.conf doesn't require one for [omarchy])
+Incoming: omarchy 4.0.3-1 → 4.0.4-1 (signature verified)
 Pending migrations: 6 (they run as you, right after the packages install)
-
- ✗ 1788745941  Update Kitty configuration
-     would modify ~/.config/kitty/kitty.conf [you customized this]
-     keeps a backup at ~/.config/kitty/kitty.conf.bak.z9mtnB
-
- ✗ 1791968925  Write the bar's tray where the bar drew it
-     would modify ~/.config/omarchy/shell.json [you customized this]
-
- ✗ 1791969355  Split the bar's center section at its anchor into centerBegin, center and centerEnd
-     would modify ~/.config/omarchy/shell.json [you customized this]
-
- ✗ 1792020559  Theme the Fcitx candidate window with the current Omarchy theme
-     would create ~/.config/fcitx5/conf/classicui.conf [new file]
-     also wants to run:
-       busctl --user --auto-start=no call org.fcitx.Fcitx5 /controller org.fcitx.Fcitx.Controlle
-
- ✓ 1792041364  Install Gliff on aarch64, now that Omarchy's repositories build it there
-     no changes to your config
-
- ✓ 1792202836  Let mpv and Chromium decode video on the video chip of Snapdragon laptops
-     no changes to your config
-
-Package files you edited by hand
- The update replaces these with the new package's copy (files in /etc get a .pacnew instead):
-   /usr/share/omarchy/default/hypr/bindings/tiling.lua
- Move those edits into ~/.config, where Omarchy expects overrides.
-
-New Omarchy defaults you won't get automatically
- Upstream changed these, but you've customized your copy, so the update leaves yours alone:
-   ~/.config/omarchy/shell.json
- What changed upstream is in the full diff.
+ 6 migrations: 3 change your files · 1 create new files · 2 no changes
+  ✗ 1788745941  Update Kitty configura: modifies ~/.config/kitty/kitty.conf [you customized this]
+  ✗ 1791968925  Write the bar's tray wh: modifies ~/.config/omarchy/shell.json [you customized this]
+  ✗ 1791969355  Split the bar's center: modifies ~/.config/omarchy/shell.json [you customized this]
 
 Summary
  2 file(s) you changed would be rewritten. Also: 0 stock, 1 new.
- Full diff: omaforecast check --diff  (saved to ~/.local/state/omaforecast/last-forecast.diff)
- Snapshot saved: 20261017-145009-pre-update
+ Full report: ~/.local/state/omaforecast/reports/omarchy_update_details_261019_14_04_UTC.md
+ Full diff:   omaforecast check --diff  (saved to ~/.local/state/omaforecast/last-forecast.diff)
+ Snapshot saved: 20261019-140500-pre-update
  After the update, undo it with: omaforecast restore  (or one file: omaforecast restore <path>)
 ```
 
-This is the output from the [end-to-end test](#testing). Add `--diff` to print each change.
+The default view summarizes migrations and shows an attention line for migrations that change your files, fail, or request `sudo`/`pkexec`. Every check, including `--no-sim`, `--quiet`, and checks with no pending migrations, saves full Markdown details in `~/.local/state/omaforecast/reports/omarchy_update_details_<YYMMDD>_<HH>_<MM>_UTC.md`. The timestamp is UTC when the check started. Runs in the same minute get `_2`, `_3`, etc.; concurrent runs reserve distinct names. `~/.local/state/omaforecast/last-forecast.md` is an atomic copy of the latest completed report. Reports are private (directory 700, files 600); the newest 20 are kept (`OMAFORECAST_KEEP_REPORTS` changes this).
+
+Use `omaforecast check --verbose` (also `--full` or `-v`) for the full per-migration terminal view, `--diff` to append diffs, or `--quiet` to write the report without terminal output except errors. Progress animates on stderr when it is a terminal, even with piped stdout. `OMAFORECAST_PROGRESS=0` disables it; `=1` forces it. After two migrations an estimated time remaining appears.
+
+
+This example shows the short view. Add `--diff` to print each change.
 
 ### Update, then see what changed
 
@@ -149,6 +143,7 @@ Without `--delete`, files the update added stay in place and the restore lists t
 | --- | --- |
 | `omaforecast check [--diff] [--offline] [--from PATH] [--allow-unsigned]` | Forecast the next update and take a snapshot |
 | `omaforecast update [-y]` | Forecast, ask if your customized files are affected, then run `omarchy update` |
+| `omaforecast self-update [--check] [--force] [--yes]` | Update omaforecast itself |
 | `omaforecast report` | Show what the last update changed, and new `.bak` and `.pacnew` files |
 | `omaforecast restore [SNAPSHOT] [PATH...]` | Put files back. Options are `--dry-run`, `--yes`, and `--delete` |
 | `omaforecast diff [SNAPSHOT] [PATH...]` | Show changes since a snapshot. `--stat` lists files only |
@@ -157,7 +152,7 @@ Without `--delete`, files the update added stay in place and the restore lists t
 | `omaforecast setup` | Install the hook and menu rows. Options are `--pacman-hook`, `--menu-update`, `--no-menu`, and `--no-hook` |
 | `omaforecast uninstall [--purge]` | Remove everything setup added |
 
-`SNAPSHOT` is a snapshot id, part of one, `latest`, or `pre-update`. The default is the last pre-update snapshot. `check --exit-code` returns 3 when files you customized would be rewritten, and 4 when it couldn't save a snapshot, for use in scripts. It always returns 5 when the dry run couldn't start (no bubblewrap, or the system blocks user namespaces): then there is no forecast, and `omaforecast update` stops. `--no-sim` skips the dry run on purpose and only lists the files the migrations mention.
+`SNAPSHOT` is a snapshot id, part of one, `latest`, or `pre-update`. The default is the last pre-update snapshot. `check --exit-code` returns 3 when files you customized would be rewritten, and 4 when it couldn't save a snapshot, for use in scripts. It always returns 5 when the dry run couldn't start (no bubblewrap, or the system blocks user namespaces): then there is no forecast, and `omaforecast update` stops. `--no-sim` skips the dry run on purpose and records the files the migrations mention in the full report.
 
 ## How it works
 
@@ -256,7 +251,7 @@ No. Only the optional pacman hook needs sudo, once, to install.
 Omarchy's Snapper config snapshots `/` only. Your config lives in `/home`, so rolling back the system doesn't bring your config back. Rolling back also means rebooting into the snapshot.
 
 **What if I don't have bubblewrap?**
-`check` falls back to reading each migration and listing the files it names, with the same "you customized this" labels. It can't show diffs in that mode.
+`check` falls back to reading each migration and recording the files it names in the full report, with the same "you customized this" labels. It can't show diffs in that mode.
 
 **Does it work with stow or chezmoi?**
 Yes. Snapshots save the file content behind each link, and a restore writes through the link.
