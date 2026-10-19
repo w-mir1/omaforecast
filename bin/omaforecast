@@ -12,7 +12,7 @@ set -uo pipefail
 # Snapshots, diffs and logs can hold secrets from your config: keep them private.
 umask 077
 
-VERSION=0.2.0
+VERSION=0.2.1
 PROG=omaforecast
 
 OMARCHY_PATH=${OMARCHY_PATH:-/usr/share/omarchy}
@@ -1445,17 +1445,34 @@ forecast_verdict() {
 }
 
 write_forecast_report() {
-  local dir=$OF_STATE/reports base=omarchy_update_details_${OF_RUN_UTC}_UTC n=1 tmp rendered f keep=${OMAFORECAST_KEEP_REPORTS:-20}
+  local dir=$OF_STATE/reports base=omarchy_update_details_${OF_RUN_UTC}_UTC n=1 tmp rendered f diff_file keep=${OMAFORECAST_KEEP_REPORTS:-20}
   mkdir -p "$dir" && chmod 700 "$dir" || die "can't create report directory"
+  DIFF_PATH=''
   while :; do
     f=$dir/$base.md
     if ((n > 1)); then f=$dir/${base}_$n.md; fi
-    if (set -o noclobber; : >"$f") 2>/dev/null; then break; fi
-    [[ -e $f || -L $f ]] || die "can't reserve report in $(tilde "$dir")"
+    if (set -o noclobber; : >"$f") 2>/dev/null; then
+      [[ -s $diffs ]] || break
+      diff_file=${f%.md}.diff
+      if (set -o noclobber; : >"$diff_file") 2>/dev/null; then
+        DIFF_PATH=$diff_file
+        break
+      fi
+      # Keep the pair on one stem, even if an orphaned diff owns this suffix.
+      rm -f -- "$f" || die "can't release report reservation"
+      [[ -e $diff_file || -L $diff_file ]] || die "can't reserve diff in $(tilde "$dir")"
+    else
+      [[ -e $f || -L $f ]] || die "can't reserve report in $(tilde "$dir")"
+    fi
     n=$((n + 1))
   done
   REPORT_PATH=$f
   chmod 600 "$f" || die "can't protect report"
+  if [[ -n $DIFF_PATH ]]; then
+    tmp=$(mktemp "$dir/.diff.XXXXXX") || die "can't create diff temporary file"
+    TMPS+=("$tmp")
+    cp -- "$diffs" "$tmp" && chmod 600 "$tmp" && mv -fT -- "$tmp" "$DIFF_PATH" || die "can't publish diff"
+  fi
   # Render into a private temp first; never rename over a reserved filename.
   tmp=$(mktemp "$dir/.report.XXXXXX") || die "can't create report temporary file"
   TMPS+=("$tmp")
@@ -1471,7 +1488,7 @@ write_forecast_report() {
     if [[ -s $work/packages ]]; then printf '\n## Package edits\n'; cat "$work/packages"; fi
     if [[ -s $work/defaults ]]; then printf '\n## New defaults\n'; cat "$work/defaults"; fi
     printf '\n## Snapshot\n\n%s\n' "$snapshot_note"
-    printf '\nFull diff: %s\n' "$(tilde "$diffs")"
+    if [[ -n $DIFF_PATH ]]; then printf '\nFull diff: %s\n' "$(tilde "$DIFF_PATH")"; fi
   } | plain_text | cat -s >"$tmp" || die "can't render report"
   rendered=$tmp
   cat -- "$rendered" >"$f" || die "can't write report"
@@ -1485,7 +1502,7 @@ write_forecast_report() {
   while IFS= read -r f; do
     grep -q '^## Snapshot$' "$f" 2>/dev/null && reports+=("$f")
   done < <(find "$dir" -maxdepth 1 -type f -name 'omarchy_update_details_*_UTC*.md' -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
-  for ((n=keep; n<${#reports[@]}; n++)); do rm -f -- "${reports[n]}"; done
+  for ((n=keep; n<${#reports[@]}; n++)); do rm -f -- "${reports[n]}" "${reports[n]%.md}.diff"; done
 }
 
 cmd_check() {
@@ -1521,9 +1538,10 @@ cmd_check() {
     say "Pending migrations: ${#pend[@]} (they run as you, right after the packages install)"
   else say "✓ No pending migrations. The update will install packages but won't run anything against your config."; fi
   mkdir -p "$OF_CACHE" "$OF_STATE" && chmod 700 "$OF_STATE" "$OF_CACHE" || die "can't create forecast state"
+  rm -f -- "$OF_STATE/last-forecast.diff" || die "can't remove legacy forecast diff"
   local work; work=$(mktemp -d "$OF_CACHE/run.XXXXXX") || die "can't create forecast work directory"
   TMPS+=("$work")
-  local diffs=$OF_STATE/last-forecast.diff
+  local diffs=$work/forecast.diff
   : >"$diffs"; chmod 600 "$diffs"
   local n_cust=0 n_stock=0 n_your=0 n_new=0 n_fail=0 SIM_FAILED=0 SIM_OK=0 SIM_NOTE=''
   local -A HIT=()
@@ -1544,7 +1562,7 @@ cmd_check() {
   B='' D='' R='' G='' Y='' C='' N='' QUIET=0 package_edits >"$work/packages"
   B='' D='' R='' G='' Y='' C='' N='' QUIET=0 new_defaults >"$work/defaults"
   QUIET=0 forecast_verdict >"$work/verdict"
-  local id='' snapshot_failed=0 snapshot_note='Snapshot disabled (--no-snapshot).' installed REPORT_PATH=''
+  local id='' snapshot_failed=0 snapshot_note='Snapshot disabled (--no-snapshot).' installed REPORT_PATH='' DIFF_PATH=''
   installed=$(omarchy_version)
   if ((snapshot)); then
     printf '%s\n' "${!HIT[@]}" | grep -v '^$' >"$work/hit" || true
@@ -1566,7 +1584,7 @@ cmd_check() {
     hdr "Summary"
     cat "$work/verdict"
     say " Full report: $(tilde "$REPORT_PATH")"
-    [[ ! -s $diffs ]] || say " Full diff:   $PROG check --diff  (saved to $(tilde "$diffs"))"
+    [[ -z $DIFF_PATH ]] || say " Full diff:   $PROG check --diff  (saved to $(tilde "$DIFF_PATH"))"
     ((snapshot)) && printf ' %s\n' "$snapshot_note"
     if ((show)) && [[ -s $diffs ]]; then hdr "Diffs"; cat "$diffs"; fi
   fi
@@ -1623,7 +1641,7 @@ new_defaults() {
   say " Upstream changed these, but you've customized your copy, so the update leaves yours alone:"
   for rel in "${out[@]}"; do
     printf '   ~/.config/%s\n' "$rel"
-    show_diff "$OMARCHY_PATH/config/$rel" "$NEW_SHARE/config/$rel" "new default: config/$rel" | sed 's/\x1b\[[0-9;]*m//g' >>"$OF_STATE/last-forecast.diff"
+    show_diff "$OMARCHY_PATH/config/$rel" "$NEW_SHARE/config/$rel" "new default: config/$rel" | sed 's/\x1b\[[0-9;]*m//g' >>"$diffs"
   done
   say " ${D}What changed upstream is in the full diff.${N}"
 }
@@ -1897,7 +1915,8 @@ ${B}Usage:${N} $PROG <command> [options]
 
 Snapshots: $(tilde "$SNAPDIR")   Scope: Omarchy's shipped ~/.config files + extras;
 add paths to $(tilde "$OF_CONF/include"), globs to $(tilde "$OF_CONF/exclude").
-Reports: $(tilde "$OF_STATE/reports")/omarchy_update_details_<YYMMDD>_<HH>_<MM>_UTC.md
+Reports: $(tilde "$OF_STATE/reports")/omarchy_update_details_<YYMMDD>_<HH>_<MM>_UTC[_N].md
+Full diffs: same stem with .diff when non-empty; pruned with their reports.
 Latest copy: $(tilde "$OF_STATE/last-forecast.md")
 Set OMAFORECAST_PROGRESS=0 to disable progress on stderr.
 Set OMAFORECAST_NO_UPDATE_CHECK=1 to disable update notices.

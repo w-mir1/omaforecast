@@ -2,6 +2,12 @@
 
 All notable changes to this project are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] - 2026-10-19
+
+### Fixed
+
+- Full forecast diffs now use the same dated, collision-safe stem as their Markdown reports in `reports/`, with private permissions and atomic writes. Reports and terminal summaries link to the saved diff only when non-empty. Checks remove the legacy `last-forecast.diff`, and pruning a report also removes its paired diff.
+
 ## [0.2.0] - 2026-10-19
 
 ### Added
@@ -57,6 +63,7 @@ First release.
 - An exclude list that can't be read, or sits in a folder that can't be searched, stops omaforecast instead of being ignored. Excludes also apply to the Omarchy state copied into the sandbox.
 - An end-to-end test builds real pacman packages from Omarchy source and checks the forecast against the real update. A smoke test runs without root or Docker.
 
+[0.2.1]: https://github.com/w-mir1/omaforecast/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/w-mir1/omaforecast/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/w-mir1/omaforecast/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/w-mir1/omaforecast/releases/tag/v0.1.0
