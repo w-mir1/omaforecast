@@ -4,13 +4,15 @@
 # before it runs, snapshot your config, and roll it back with one command.
 #
 # https://github.com/w-mir1/omaforecast  (MIT)
+# Guard chains intentionally fail if either step fails; quoted scripts/regexes expand later.
+# shellcheck disable=SC2015,SC2016
 # shellcheck disable=SC2088  # "~/" is display text, never expanded
 
 set -uo pipefail
 # Snapshots, diffs and logs can hold secrets from your config: keep them private.
 umask 077
 
-VERSION=0.1.1
+VERSION=0.2.0
 PROG=omaforecast
 
 OMARCHY_PATH=${OMARCHY_PATH:-/usr/share/omarchy}
@@ -30,12 +32,67 @@ else
   B='' D='' R='' G='' Y='' C='' N=''
 fi
 QUIET=0
-say() { ((QUIET)) || printf '%s\n' "$*"; }
-hdr() { ((QUIET)) || printf '\n%s%s%s\n' "$B" "$*" "$N"; }
-warn() { printf '%s%s:%s %s\n' "$Y" "$PROG" "$N" "$*" >&2; }
-die() { printf '%s%s:%s %s\n' "$R" "$PROG" "$N" "$*" >&2; exit 1; }
+say() { progress_stop; ((QUIET)) || printf '%s\n' "$*"; }
+hdr() { progress_stop; ((QUIET)) || printf '\n%s%s%s\n' "$B" "$*" "$N"; }
+warn() { progress_stop; ((QUIET)) && return 0; printf '%s%s:%s %s\n' "$Y" "$PROG" "$N" "$*" >&2; }
+die() { progress_stop; printf '%s%s:%s %s\n' "$R" "$PROG" "$N" "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 tilde() { local p=$1; [[ $p == "$HOME"/* ]] && p="~/${p#"$HOME"/}"; printf '%s' "$p"; }
+
+# Progress owns stderr only. Stop and join the ticker before printing anything.
+PROGRESS_PID='' PROGRESS_FILE='' PROGRESS_OWNER=''
+progress_stop() {
+  [[ $PROGRESS_OWNER == "$BASHPID" ]] || return 0
+  if [[ -n $PROGRESS_PID ]]; then
+    kill "$PROGRESS_PID" 2>/dev/null || true
+    wait "$PROGRESS_PID" 2>/dev/null || true
+    PROGRESS_PID=''
+    printf '\r\e[2K' >&2
+  fi
+  return 0
+}
+
+progress_phase() {
+  ((QUIET)) && return 0
+  [[ ${OMAFORECAST_PROGRESS:-} != 0 && ${hook:-0} == 0 ]] || return 0
+  [[ -t 2 || ${OMAFORECAST_PROGRESS:-} == 1 ]] || return 0
+  local frames=$'|/-\\' parent=$BASHPID
+  case ${LC_ALL:-${LC_CTYPE:-${LANG:-}}} in *[Uu][Tt][Ff]-8* | *[Uu][Tt][Ff]8*) frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' ;; esac
+  if [[ -z $PROGRESS_FILE ]]; then
+    PROGRESS_FILE=$(mktemp) || return 0
+    TMPS+=("$PROGRESS_FILE" "$PROGRESS_FILE.next")
+  fi
+  printf '%s\n' "$*" >"$PROGRESS_FILE.next" && mv -f -- "$PROGRESS_FILE.next" "$PROGRESS_FILE" || return 0
+  # Emit transitions synchronously too, even when a phase takes under 150ms.
+  printf '\r\e[2K%s %s' "${frames:0:1}" "$*" >&2
+  [[ -z $PROGRESS_PID ]] || return 0
+  PROGRESS_OWNER=$BASHPID
+  (
+    trap - EXIT INT TERM
+    local i=0 text
+    while kill -0 "$parent" 2>/dev/null; do
+      sleep 0.15
+      IFS= read -r text <"$PROGRESS_FILE" || break
+      printf '\r\e[2K%s %s' "${frames:i++ % ${#frames}:1}" "$text" >&2
+    done
+  ) &
+  PROGRESS_PID=$!
+}
+
+progress_migration() { # completed total mid elapsed-seconds
+  local completed=$1 total=$2 mid=$3 elapsed=$4 eta='estimating…' seconds minutes
+  if ((completed >= 2)); then
+    seconds=$(((elapsed * (total - completed) + completed - 1) / completed))
+    ((seconds > 0)) || seconds=1
+    if ((seconds < 60)); then eta="~${seconds}s left"
+    else
+      minutes=$(((seconds + 59) / 60))
+      if ((minutes < 60)); then eta="~${minutes}m left"
+      else eta="~$((minutes / 60))h $((minutes % 60))m left"; fi
+    fi
+  fi
+  progress_phase "Dry-running migration $((completed + 1))/$total ($mid) · $eta"
+}
 
 same_file() { # same content? (missing == missing)
   [[ -e $1 || -e $2 ]] || return 0
@@ -52,8 +109,10 @@ confirm() { # confirm "question"  (assumes yes with --yes)
 }
 ASSUME_YES=0
 TMPS=()
-cleanup() { ((${#TMPS[@]})) && rm -rf "${TMPS[@]}"; return 0; }
+cleanup() { progress_stop; ((${#TMPS[@]})) && rm -rf "${TMPS[@]}"; return 0; }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 show_diff() { # show_diff old new label
   local old=$1 new=$2 label=$3
@@ -231,6 +290,73 @@ under_any() {
 
 # --------------------------------------------------------------- versions ---
 
+# The script's VERSION line is the source of truth for both update paths.
+self_update_url() {
+  local base=${OMAFORECAST_RAW_BASE:-https://raw.githubusercontent.com}
+  case $base in file://* | http://* | https://*) ;; *) return 1 ;; esac
+  printf '%s/%s/%s/bin/omaforecast\n' "${base%/}" "${OMAFORECAST_REPO:-w-mir1/omaforecast}" "${OMAFORECAST_REF:-main}"
+}
+
+valid_version() { [[ $1 =~ ^[0-9]+(\.[0-9]+)*([.+-][0-9A-Za-z.]+)?$ ]]; }
+newer_version() { [[ $1 != "$2" && $(printf '%s\n' "$1" "$2" | sort -V | tail -1) == "$1" ]]; }
+
+cache_latest_version() {
+  local tmp
+  mkdir -p "$OF_CACHE" || return 1
+  tmp=$(mktemp "$OF_CACHE/.latest-version.XXXXXX") || return 1
+  if printf '%s\n' "$1" >"$tmp" && mv -f -- "$tmp" "$OF_CACHE/latest-version"; then return 0; fi
+  rm -f -- "$tmp"; return 1
+}
+
+update_notice() {
+  [[ -z ${OMAFORECAST_NO_UPDATE_CHECK:-} && ! ${CI+x} && -z ${OMAFORECAST_SOURCED:-} ]] || return 0
+  ((EUID != 0)) || return 0
+  [[ $SELF != "$SYS_DIR" && $SELF != "$SYS_DIR"/* ]] || return 0
+  [[ -t 2 || ${OMAFORECAST_UPDATE_CHECK_FORCE_TTY:-} == 1 ]] || return 0
+  local cmd=${1:-help} arg
+  case $cmd in
+    self-update | upgrade | setup | install | uninstall | remove | report | snapshot | snap | version | -v | --version) return 0 ;;
+  esac
+  for arg in "$@"; do
+    case $arg in --offline | -q | --quiet | --hook) return 0 ;; esac
+    case $cmd:$arg in update:--self | up:--self) return 0 ;; esac
+  done
+
+  local cache=$OF_CACHE/latest-version latest="" mtime now interval=${OMAFORECAST_UPDATE_CHECK_INTERVAL:-86400}
+  [[ $interval =~ ^[0-9]+$ ]] || interval=86400
+  # Read before starting a fetch: this invocation only ever sees cached data.
+  [[ ! -r $cache ]] || IFS= read -r latest <"$cache" || true
+  if valid_version "$latest" && newer_version "$latest" "$VERSION"; then
+    local yellow="" reset=""
+    if [[ -t 2 && -z ${NO_COLOR:-} ]]; then yellow=$'\e[33m' reset=$'\e[0m'; fi
+    printf '%somaforecast %s is available (you have %s). Run: omaforecast self-update%s\n' "$yellow" "$latest" "$VERSION" "$reset" >&2
+  fi
+  printf -v now '%(%s)T' -1
+  mtime=$(stat -c %Y -- "$cache" 2>/dev/null) || mtime=0
+  ((now - mtime >= 10#$interval)) || return 0
+  have curl || return 0
+  mkdir -p "$OF_CACHE" || return 0
+  # Serialize the freshness check and touch. Failed/offline fetches also wait
+  # an interval before retrying; existing version content is kept intact.
+  mkdir "$cache.lock" 2>/dev/null || return 0
+  mtime=$(stat -c %Y -- "$cache" 2>/dev/null) || mtime=0
+  if ((now - mtime < 10#$interval)) || ! touch -- "$cache"; then
+    rmdir "$cache.lock"; return 0
+  fi
+  rmdir "$cache.lock"
+  (
+    trap '' HUP
+    trap - EXIT
+    local url v
+    url=$(self_update_url) || exit 0
+    # sed drains the response, avoiding curl SIGPIPE with pipefail enabled.
+    v=$(curl -fsS --connect-timeout 2 --max-time 4 "$url" | sed -n '1,40{s/^VERSION=//p;}') || exit 0
+    v=${v%%$'\n'*}
+    valid_version "$v" && cache_latest_version "$v"
+  ) </dev/null >/dev/null 2>&1 & disown
+  return 0
+}
+
 omarchy_version() {
   local v p
   if have omarchy-version; then
@@ -271,7 +397,7 @@ resolve_snap() { # resolve_snap [ARG] → id
         [[ $(snap_meta "$id" label) == pre-update ]] && { echo "$id"; return; }
       done ;;
     *)
-      if [[ $arg != */* && -d $SNAPDIR/$arg ]] && snap_ids | grep -qxF -- "$arg"; then echo "$arg"; return; fi
+      if [[ $arg != */* && -d $SNAPDIR/$arg ]] && snap_ids | grep -xF -- "$arg" >/dev/null; then echo "$arg"; return; fi
       snap_ids | grep -F -- "$arg" | tail -1 ;;
   esac
 }
@@ -756,6 +882,7 @@ fetch_incoming() {
       pacman -Qq "$p" >/dev/null 2>&1 && pkgs+=("$p")
     done
     if ((${#pkgs[@]})); then
+      progress_phase "Syncing package database…"
       mkdir -p "$db"
       ln -sfn /var/lib/pacman/local "$db/local"
       local synced=0 sync_rc
@@ -806,6 +933,7 @@ fetch_incoming() {
   # archive; the root version file is only a development placeholder.
   if ((!offline)); then
     if have curl && have tar; then
+      progress_phase "Downloading Omarchy source…"
       local api=https://api.github.com/repos/omacom/omarchy
       local source=https://codeload.github.com/omacom/omarchy/tar.gz
       local tags tag ref label sha=""
@@ -963,12 +1091,12 @@ mig_desc() {
 # simulation needs to copy.
 mig_static_paths() {
   local f=$1 x
-  grep -oE '(\$HOME|\$\{HOME\}|~)/\.[A-Za-z0-9_./-]+' "$f" | sed -E 's#^(\$HOME|\$\{HOME\}|~)/##; s#/+$##' | sed 's#\.\.\.$##'
-  grep -oE 'omarchy-refresh-config[[:space:]]+"?[A-Za-z0-9_./-]+' "$f" | awk '{gsub(/"/,"",$2); print ".config/" $2}'
-  for x in $(grep -oE 'omarchy-refresh-[a-z0-9-]+' "$f" | sort -u); do
+  LC_ALL=C grep -oE '(\$HOME|\$\{HOME\}|~)/\.[A-Za-z0-9_./-]+' "$f" | sed -E 's#^(\$HOME|\$\{HOME\}|~)/##; s#/+$##' | sed 's#\.\.\.$##'
+  LC_ALL=C grep -oE 'omarchy-refresh-config[[:space:]]+"?[A-Za-z0-9_./-]+' "$f" | awk '{gsub(/"/,"",$2); print ".config/" $2}'
+  while IFS= read -r x; do
     [[ $x == omarchy-refresh-config ]] && continue
-    [[ -f $NEW_BIN/$x ]] && grep -oE 'omarchy-refresh-config[[:space:]]+[A-Za-z0-9_./-]+' "$NEW_BIN/$x" | awk '{print ".config/" $2}'
-  done
+    [[ -f $NEW_BIN/$x ]] && LC_ALL=C grep -oE 'omarchy-refresh-config[[:space:]]+[A-Za-z0-9_./-]+' "$NEW_BIN/$x" | awk '{print ".config/" $2}'
+  done < <(LC_ALL=C grep -oE 'omarchy-refresh-[a-z0-9-]+' "$f" | sort -u)
   grep -q 'omarchy-reinstall-configs' "$f" && echo ".config"
   return 0
 }
@@ -1043,6 +1171,7 @@ copy_new_bins() {
 SIM_OK=0 SIM_NOTE=""
 simulate() { # simulate WORK MIGRATIONS...   fills $WORK/result/<mig>.changes
   local work=$1; shift
+  progress_phase "Preparing sandbox…"
   if ! [[ $SIM_TIMEOUT =~ ^[0-9]+(\.[0-9]+)?[smhd]?$ ]]; then
     SIM_NOTE="OMAFORECAST_SIM_TIMEOUT must be a duration such as 120 or 5m, not '$SIM_TIMEOUT'"
     return 1
@@ -1052,8 +1181,8 @@ simulate() { # simulate WORK MIGRATIONS...   fills $WORK/result/<mig>.changes
     return 1
   fi
   local berr
-  if ! berr=$(bwrap --ro-bind / / --unshare-all --die-with-parent true 2>&1); then
-    SIM_NOTE="bubblewrap can't create a sandbox here (user namespaces disabled?)${berr:+: ${berr%%$'\n'*}}"
+  if ! berr=$(bwrap --ro-bind / / --proc /proc --dev /dev --tmpfs /tmp --unshare-all --die-with-parent true 2>&1); then
+    SIM_NOTE="bubblewrap can't create a sandbox here${berr:+: ${berr%%$'\n'*}}"
     return 1
   fi
 
@@ -1132,9 +1261,10 @@ simulate() { # simulate WORK MIGRATIONS...   fills $WORK/result/<mig>.changes
     --setenv XDG_RUNTIME_DIR /tmp --setenv OMARCHY_UPDATE_UNATTENDED 1
     --setenv OMAFORECAST_SIM 1 --setenv OF_LOG /tmp/of/log/actions.log)
 
-  local prev=$work/state.0 i=0 rc
+  local prev=$work/state.0 i=0 rc started=$SECONDS
   cp -a "$home" "$prev"
   for m in "$@"; do
+    progress_migration "$i" "$#" "${m%.sh}" "$((SECONDS - started))"
     i=$((i + 1))
     # The marker is written inside the sandbox too: the host never writes into
     # the sandbox's home, where a migration could have planted a symlink.
@@ -1179,13 +1309,198 @@ tag() {
   esac
 }
 
+# Strip terminal controls (including ANSI sequences) from untrusted labels/logs.
+plain_text() { LC_ALL=C sed -E $'s/\033\\[[0-?]*[ -/]*[@-~]//g; s/\033\\][^\a]*(\a|$)//g' | LC_ALL=C tr -d '\000-\010\013-\037\177'; }
+md_text() { plain_text | sed 's/`/ˋ/g'; }
+short_line() { # prefix description suffix: preserve file/log details in full
+  local prefix desc suffix budget
+  prefix=$(printf '%s' "$1" | plain_text)
+  desc=$(printf '%s' "$2" | plain_text)
+  suffix=$(printf '%s' "$3" | plain_text)
+  budget=$((110 - ${#prefix} - ${#suffix}))
+  if ((budget <= 0)); then desc=''
+  elif ((${#desc} > budget)); then desc="${desc:0:budget-1}…"; fi
+  printf '%s%s%s\n' "$prefix" "$desc" "$suffix"
+}
+
+# Collect once into plain renderings. Dynamic scope supplies cmd_check's work,
+# pending list, unique file classifications and counters to these helpers.
+forecast_migrations() {
+  local B='' D='' R='' G='' Y='' C='' N='' QUIET=0
+  local m mid desc rc ch s f cls idx=0 rank own acts status label detail suffix
+  local -a userfiles=()
+  : >"$work/migrations.md"; : >"$work/verbose"; : >"$work/short"
+  for m in "${pend[@]}"; do
+    idx=$((idx + 1)); mid=${m%.sh}
+    desc=$(mig_desc "$NEW_SHARE/migrations/$m" | md_text)
+    printf '\n### %s — %s\n\n' "$mid" "$desc" >>"$work/migrations.md"
+    rc=0 rank=0 own=0 acts='' userfiles=()
+    : >"$work/files.md"; : >"$work/details"
+    if ((SIM_OK)); then
+      ch=$work/result/$m.changes; rc=$(cat "$work/result/$m.rc")
+      while IFS=$'\t' read -r _ s f; do
+        [[ $f == .local/state/omarchy/* || $f == .cache/* ]] && continue
+        own=1
+        if [[ $s == A && $f == *.bak.* ]]; then
+          printf '     keeps a backup at ~/%s\n' "$f" >>"$work/details"
+          printf -- '- Keeps a backup at ~/%s\n' "$f" >>"$work/files.md"
+          continue
+        fi
+        if [[ -e $HOME/$f ]]; then cls=$(classify "$f"); else cls=new; fi
+        HIT[$f]=$cls
+        case $cls in
+          customized | yours) rank=3; userfiles+=("~/$f $(tag "$cls")") ;;
+          stock) ((rank < 2)) && rank=2 ;;
+          new) ((rank < 1)) && rank=1 ;;
+        esac
+        label=$(tag "$cls"); [[ $cls == new ]] && label='[new file]'
+        detail="would $(case $s in M) echo modify;; A) echo create;; D) echo delete;; esac) ~/$f $label"
+        printf '     %s\n' "$detail" >>"$work/details"
+        printf -- '- %s\n' "$detail" >>"$work/files.md"
+        show_diff_into "$work" "$idx" "$m" "$f" >>"$diffs"
+      done <"$ch"
+      acts=$(awk -F'\t' -v m="$mid" '$1==m{print substr($0,index($0,"\t")+1)}' "$work/actions.log" |
+        sort -u | grep -vE '^(gum (style|format|spin)|pacman -Q)' | md_text)
+      if [[ -n $acts ]]; then
+        printf '     also wants to run:\n' >>"$work/details"
+        head -6 <<<"$acts" | cut -c1-96 | sed 's/^/       /' >>"$work/details"
+      fi
+      mkdir -p "$OF_STATE/sim-logs" && chmod 700 "$OF_STATE/sim-logs"
+      cp -- "$work/result/$m.out" "$OF_STATE/sim-logs/$mid.log" && chmod 600 "$OF_STATE/sim-logs/$mid.log"
+      if [[ $rc != 0 ]]; then
+        rank=4; n_fail=$((n_fail + 1))
+        printf '     dry run exited %s (log: %s). If this is a real error, omarchy-migrate would stop here too.\n' "$rc" "$(tilde "$OF_STATE/sim-logs/$mid.log")" >>"$work/details"
+        static_mentions "$NEW_SHARE/migrations/$m" >>"$work/details"
+      elif ((!own)); then printf '     no changes to your config\n' >>"$work/details"; fi
+      case $rank in
+        4) status="**Dry run didn't finish (exit $rc)**" ;;
+        3) status='**Changes your files**' ;;
+        2) status='Changes stock files' ;;
+        1) status='Creates new files' ;;
+        0) status='No changes to your config' ;;
+      esac
+      if ((own)); then label=✗; elif [[ $rc != 0 ]]; then label='?'; else label=✓; fi
+    else
+      rank=5; label='?'; status='Not simulated'
+      static_mentions "$NEW_SHARE/migrations/$m" >>"$work/details"
+    fi
+    buckets[rank]=$((buckets[rank] + 1))
+    {
+      printf '\n %s %s  %s\n' "$label" "$mid" "$desc"
+      cat "$work/details"
+    } >>"$work/verbose"
+    {
+      printf '%s\n\n' "$status"
+      cat "$work/files.md"
+      if [[ -n $acts ]]; then printf '\nAlso wants to run:\n\n```text\n%s\n```\n' "$acts"; fi
+      if ((SIM_OK)); then printf '\nDry-run log: %s\n' "$(tilde "$OF_STATE/sim-logs/$mid.log")"; fi
+      if ((!SIM_OK)) || [[ $rc != 0 ]]; then
+        local sm; sm=$(static_mentions "$NEW_SHARE/migrations/$m")
+        [[ -n $sm ]] && printf '\nStatic mentions (not a forecast):\n\n%s\n' "$sm"
+      fi
+    } >>"$work/migrations.md"
+    # One attention line per migration, with failure taking precedence.
+    if ((SIM_OK)) && [[ $rc != 0 ]]; then
+      short_line "  ? $mid  " "$desc" ": dry run exited $rc (log: $(tilde "$OF_STATE/sim-logs/$mid.log"))" >>"$work/short"
+    elif ((${#userfiles[@]})); then
+      detail="${userfiles[0]}"
+      ((${#userfiles[@]} > 1)) && detail+=", ${userfiles[1]}"
+      suffix=''
+      ((${#userfiles[@]} > 2)) && suffix=" +$((${#userfiles[@]} - 2)) more"
+      short_line "  ✗ $mid  " "$desc" ": modifies $detail$suffix" >>"$work/short"
+    elif grep -qE '^(sudo |pkexec )' <<<"$acts"; then
+      detail=$(grep -E '^(sudo |pkexec )' <<<"$acts" | paste -sd ',')
+      short_line "  ! $mid  " "$desc" ": runs sudo ($detail)" >>"$work/short"
+    fi
+  done
+}
+
+forecast_counts() {
+  local i line=" ${#pend[@]} migrations:" sep=' ' names=('no changes' 'create new files' 'stock' 'change your files' "dry run didn't finish" 'not simulated')
+  for i in 3 2 1 0 4 5; do
+    ((buckets[i])) || continue
+    line+="$sep${buckets[i]} ${names[i]}"; sep=' · '
+  done
+  printf '%s\n' "$line"
+}
+
+forecast_verdict() {
+  if ((SIM_OK)); then
+    ((n_fail)) && say " $n_fail dry run(s) didn't finish, so the forecast for those is partial (see the full report)."
+    if ((n_cust + n_your > 0)); then
+      say " $((n_cust + n_your)) file(s) you changed would be rewritten. Also: $n_stock stock, $n_new new."
+    elif ((n_stock > 0)); then
+      say " None of your customizations are touched. $n_stock stock file(s) would be updated, $n_new created."
+    elif ((n_new > 0)); then
+      say " None of your customizations are touched. $n_new new file(s) would be created."
+    elif ((n_fail == 0)); then say " This update leaves your config alone."; fi
+  elif ((SIM_FAILED)); then
+    say " No forecast: the dry run couldn't start. $SIM_NOTE"
+    say " Fix the sandbox and run $PROG check again, or use $PROG check --no-sim for static mentions."
+  elif ((${#pend[@]})); then
+    say " Dry run skipped (--no-sim). The full report lists what migrations mention, not a forecast."
+  else
+    say " No pending migrations. The update will install packages but won't run anything against your config."
+  fi
+}
+
+write_forecast_report() {
+  local dir=$OF_STATE/reports base=omarchy_update_details_${OF_RUN_UTC}_UTC n=1 tmp rendered f keep=${OMAFORECAST_KEEP_REPORTS:-20}
+  mkdir -p "$dir" && chmod 700 "$dir" || die "can't create report directory"
+  while :; do
+    f=$dir/$base.md
+    if ((n > 1)); then f=$dir/${base}_$n.md; fi
+    if (set -o noclobber; : >"$f") 2>/dev/null; then break; fi
+    [[ -e $f || -L $f ]] || die "can't reserve report in $(tilde "$dir")"
+    n=$((n + 1))
+  done
+  REPORT_PATH=$f
+  chmod 600 "$f" || die "can't protect report"
+  # Render into a private temp first; never rename over a reserved filename.
+  tmp=$(mktemp "$dir/.report.XXXXXX") || die "can't create report temporary file"
+  TMPS+=("$tmp")
+  {
+    printf '# omaforecast forecast — %s\n\n' "$run_date"
+    printf -- '- Incoming: %s (%s), installed: %s, omaforecast %s\n' "$NEW_DESC" "${PKG_SIG:-local tree; no package signature}" "$installed" "$VERSION"
+    [[ -z $FETCH_NOTE ]] || printf -- '- Fetch note: %s\n' "$FETCH_NOTE"
+    printf -- '- Pending migrations: %s\n\n## Summary\n\n' "${#pend[@]}"
+    forecast_counts
+    cat "$work/verdict"
+    printf '\n## Migrations\n'
+    if ((${#pend[@]})); then cat "$work/migrations.md"; else printf '\nNo pending migrations.\n'; fi
+    if [[ -s $work/packages ]]; then printf '\n## Package edits\n'; cat "$work/packages"; fi
+    if [[ -s $work/defaults ]]; then printf '\n## New defaults\n'; cat "$work/defaults"; fi
+    printf '\n## Snapshot\n\n%s\n' "$snapshot_note"
+    printf '\nFull diff: %s\n' "$(tilde "$diffs")"
+  } | plain_text | cat -s >"$tmp" || die "can't render report"
+  rendered=$tmp
+  cat -- "$rendered" >"$f" || die "can't write report"
+  tmp=$(mktemp "$OF_STATE/.last-forecast.XXXXXX") || die "can't create latest report copy"
+  TMPS+=("$tmp")
+  cp -- "$rendered" "$tmp" && chmod 600 "$tmp" && mv -fT -- "$tmp" "$OF_STATE/last-forecast.md" || die "can't publish latest report copy"
+  [[ $keep =~ ^[1-9][0-9]*$ ]] || keep=20
+  # Only completed reports in our namespace are candidates; unrelated files
+  # and another process's reserved/unfinished report are left alone.
+  local -a reports=()
+  while IFS= read -r f; do
+    grep -q '^## Snapshot$' "$f" 2>/dev/null && reports+=("$f")
+  done < <(find "$dir" -maxdepth 1 -type f -name 'omarchy_update_details_*_UTC*.md' -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
+  for ((n=keep; n<${#reports[@]}; n++)); do rm -f -- "${reports[n]}"; done
+}
+
 cmd_check() {
-  local from="" offline=0 show=0 snapshot=1 sim=1 exitcode=0
+  # Capture once before fetching/simulating; the filename describes start time.
+  local OF_RUN_UTC=${OMAFORECAST_NOW_UTC:-$(date -u +%y%m%d_%H_%M)} run_date
+  [[ $OF_RUN_UTC =~ ^[0-9]{6}_[0-9]{2}_[0-9]{2}$ ]] || die "OMAFORECAST_NOW_UTC must be YYMMDD_HH_MM"
+  run_date=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+  local from='' offline=0 show=0 snapshot=1 sim=1 exitcode=0 verbose=0 hook=0
   while (($#)); do
     case $1 in
       --from) from=${2:?--from needs a path}; shift ;;
       --offline) offline=1 ;;
       --diff | -d) show=1 ;;
+      --verbose | --full | -v) verbose=1 ;;
+      --hook) hook=1 ;;
       --no-snapshot) snapshot=0 ;;
       --no-sim) sim=0 ;;
       --exit-code) exitcode=1 ;;
@@ -1195,116 +1510,67 @@ cmd_check() {
     esac
     shift
   done
-
   hdr "omaforecast: what will the next Omarchy update do to your config?"
-  say "${D}Looking for the incoming release…${N}"
+  progress_phase "Fetching incoming release…"
   fetch_incoming "$from" "$offline"
-  say "Incoming: ${C}$NEW_DESC${N}${PKG_SIG:+ ${D}($PKG_SIG)${N}}"
-  [[ -n $FETCH_NOTE ]] && warn "$FETCH_NOTE"
-
+  progress_stop
+  say "Incoming: ${C}$NEW_DESC${N}${PKG_SIG:+ ($PKG_SIG)}"
+  [[ -z $FETCH_NOTE ]] || warn "$FETCH_NOTE"
   local pend; mapfile -t pend < <(pending_migrations)
-  mkdir -p "$OF_CACHE"
-  local work; work=$(mktemp -d "$OF_CACHE/run.XXXXXX"); TMPS+=("$work")
+  if ((${#pend[@]})); then
+    say "Pending migrations: ${#pend[@]} (they run as you, right after the packages install)"
+  else say "✓ No pending migrations. The update will install packages but won't run anything against your config."; fi
+  mkdir -p "$OF_CACHE" "$OF_STATE" && chmod 700 "$OF_STATE" "$OF_CACHE" || die "can't create forecast state"
+  local work; work=$(mktemp -d "$OF_CACHE/run.XXXXXX") || die "can't create forecast work directory"
+  TMPS+=("$work")
   local diffs=$OF_STATE/last-forecast.diff
-  mkdir -p "$OF_STATE" && chmod 700 "$OF_STATE" "$OF_CACHE"; : >"$diffs"; chmod 600 "$diffs"
-
-  local n_cust=0 n_stock=0 n_your=0 n_new=0 n_fail=0 SIM_FAILED=0
+  : >"$diffs"; chmod 600 "$diffs"
+  local n_cust=0 n_stock=0 n_your=0 n_new=0 n_fail=0 SIM_FAILED=0 SIM_OK=0 SIM_NOTE=''
   local -A HIT=()
-  if ((${#pend[@]} == 0)); then
-    hdr "${G}✓ No pending migrations.${N} The update will install packages but won't run anything against your config."
-  else
-    say "Pending migrations: ${B}${#pend[@]}${N} (they run as you, right after the packages install)"
-    ((sim)) && simulate "$work" "${pend[@]}"
-    # A dry run that couldn't start is an error, never an empty forecast.
-    if ((sim && !SIM_OK)); then
+  local -a buckets=(0 0 0 0 0 0)
+  if ((${#pend[@]} && sim)); then
+    simulate "$work" "${pend[@]}"
+    progress_stop
+    if ((!SIM_OK)); then
       SIM_FAILED=1
-      printf '%s%s: error:%s %s\n' "$R" "$PROG" "$N" "${SIM_NOTE:-the dry run did not start}" >&2
-      printf '%s%s:%s %s\n' "$R" "$PROG" "$N" "No forecast was made. Below is only what the migrations mention, not what they would change." >&2
+      printf '%s: error: %s\n%s: No forecast was made. Static mentions are in the full report.\n' "$PROG" "$SIM_NOTE" "$PROG" >&2
     fi
-
-    local m desc rc ch cls s f mid idx=0
-    for m in "${pend[@]}"; do
-      idx=$((idx + 1)); mid=${m%.sh}
-      desc=$(mig_desc "$NEW_SHARE/migrations/$m")
-      if ((SIM_OK)); then
-        ch=$work/result/$m.changes rc=$(cat "$work/result/$m.rc")
-        local own=0
-        while IFS=$'\t' read -r _ s f; do
-          [[ $f == .local/state/omarchy/* || $f == .cache/* ]] && continue
-          own=1
-        done <"$ch"
-        if ((own)); then printf '\n %s✗%s %s%s%s  %s\n' "$Y" "$N" "$B" "$mid" "$N" "$desc"
-        elif [[ $rc != 0 ]]; then printf '\n %s?%s %s%s%s  %s\n' "$Y" "$N" "$B" "$mid" "$N" "$desc"
-        else printf '\n %s✓%s %s%s%s  %s\n' "$G" "$N" "$B" "$mid" "$N" "$desc"; fi
-        while IFS=$'\t' read -r _ s f; do
-          [[ $f == .local/state/omarchy/* || $f == .cache/* ]] && continue
-          if [[ $s == A && $f == *.bak.* ]]; then
-            printf '     %skeeps a backup at ~/%s%s\n' "$D" "$f" "$N"
-            continue
-          fi
-          if [[ -e $HOME/$f ]]; then cls=$(classify "$f"); else cls=new; fi
-          HIT[$f]=$cls
-          printf '     would %s ~/%s %s\n' "$(case $s in M) echo modify;; A) echo create;; D) echo delete;; esac)" "$f" "$( [[ $cls == new ]] && printf '%s[new file]%s' "$D" "$N" || tag "$cls")"
-          show_diff_into "$work" "$idx" "$m" "$f" >>"$diffs"
-        done <"$ch"
-        if ((!own)) && [[ $rc == 0 ]]; then printf '     %sno changes to your config%s\n' "$D" "$N"; fi
-        local acts; acts=$(awk -F'\t' -v m="$mid" '$1==m{print $2}' "$work/actions.log" | sort -u | grep -vE '^(gum (style|format|spin)|pacman -Q)' | head -6)
-        [[ -n $acts ]] && printf '     %salso wants to run:%s\n%s\n' "$D" "$N" "$(sed 's/^/       /' <<<"$acts" | cut -c1-96)"
-        mkdir -p "$OF_STATE/sim-logs" && chmod 700 "$OF_STATE/sim-logs"; cp "$work/result/$m.out" "$OF_STATE/sim-logs/$mid.log"; chmod 600 "$OF_STATE/sim-logs/$mid.log"
-        if [[ $rc != 0 ]]; then
-          n_fail=$((n_fail + 1))
-          printf '     %sdry run exited %s (log: %s). If this is a real error, omarchy-migrate would stop here too.%s\n' "$Y" "$rc" "$(tilde "$OF_STATE/sim-logs/$mid.log")" "$N"
-          static_mentions "$NEW_SHARE/migrations/$m"
-        fi
-      else
-        printf '\n %s?%s %s%s%s  %s\n' "$Y" "$N" "$B" "$mid" "$N" "$desc"
-        static_mentions "$NEW_SHARE/migrations/$m"
-      fi
-    done
   fi
-
+  forecast_migrations
   local k
   for k in "${!HIT[@]}"; do
     case ${HIT[$k]} in customized) n_cust=$((n_cust + 1)) ;; stock) n_stock=$((n_stock + 1)) ;; yours) n_your=$((n_your + 1)) ;; new) n_new=$((n_new + 1)) ;; esac
   done
-
-  package_edits
-  new_defaults
-
-  hdr "Summary"
-  if ((SIM_OK)); then
-    ((n_fail)) && say " ${Y}$n_fail dry run(s) didn't finish${N}, so the forecast for those is partial (see the files they mention above)."
-    if ((n_cust + n_your > 0)); then
-      say " ${R}$((n_cust + n_your)) file(s) you changed would be rewritten.${N} Also: $n_stock stock, $n_new new."
-    elif ((n_stock > 0)); then
-      say " ${G}None of your customizations are touched.${N} $n_stock stock file(s) would be updated, $n_new created."
-    elif ((n_new > 0)); then
-      say " ${G}None of your customizations are touched.${N} $n_new new file(s) would be created."
-    elif ((n_fail)); then
-      :
-    else
-      say " ${G}This update leaves your config alone.${N}"
-    fi
-    [[ -s $diffs ]] && say " Full diff: ${C}$PROG check --diff${N}  (saved to $(tilde "$diffs"))"
-  elif ((SIM_FAILED)); then
-    say " ${R}No forecast: the dry run couldn't start.${N} ${SIM_NOTE}"
-    say " Nothing above says your config is safe. Fix the sandbox and run ${C}$PROG check${N} again,"
-    say " or use ${C}$PROG check --no-sim${N} for the list of files the migrations mention."
-  elif ((${#pend[@]})); then
-    say " ${Y}Dry run skipped (--no-sim).${N} The list above is what the migrations mention, not a forecast."
-  fi
+  B='' D='' R='' G='' Y='' C='' N='' QUIET=0 package_edits >"$work/packages"
+  B='' D='' R='' G='' Y='' C='' N='' QUIET=0 new_defaults >"$work/defaults"
+  QUIET=0 forecast_verdict >"$work/verdict"
+  local id='' snapshot_failed=0 snapshot_note='Snapshot disabled (--no-snapshot).' installed REPORT_PATH=''
+  installed=$(omarchy_version)
   if ((snapshot)); then
     printf '%s\n' "${!HIT[@]}" | grep -v '^$' >"$work/hit" || true
-    local id
-    if id=$(OF_EXTRA_FILES=$work/hit QUIET=1 cmd_snapshot pre-update --quiet) && [[ -n $id ]]; then
-      say " ${G}Snapshot saved:${N} $id"
-      say " After the update, undo it with: ${C}$PROG restore${N}  (or one file: $PROG restore <path>)"
+    progress_phase "Taking snapshot…"
+    if id=$(OF_EXTRA_FILES=$work/hit QUIET=1 cmd_snapshot pre-update --quiet 2>"$work/snapshot.err") && [[ -n $id ]]; then
+      snapshot_note="Snapshot saved: $id"$'\n'"After the update, undo it with: $PROG restore  (or one file: $PROG restore <path>)"
     else
-      say " ${R}No snapshot was saved${N} (see the error above). Fix that before updating."
-      ((exitcode)) && return 4
+      snapshot_failed=1
+      snapshot_note='No snapshot was saved (see the error above). Fix that before updating.'
     fi
+    progress_stop
+    [[ ! -s $work/snapshot.err ]] || cat "$work/snapshot.err" >&2
   fi
-  if ((show)) && [[ -s $diffs ]]; then hdr "Diffs"; cat "$diffs"; fi
+  write_forecast_report
+  if ((!QUIET)); then
+    ((${#pend[@]} == 0)) || forecast_counts
+    if ((verbose)); then cat "$work/verbose" "$work/packages" "$work/defaults"
+    else cat "$work/short"; fi
+    hdr "Summary"
+    cat "$work/verdict"
+    say " Full report: $(tilde "$REPORT_PATH")"
+    [[ ! -s $diffs ]] || say " Full diff:   $PROG check --diff  (saved to $(tilde "$diffs"))"
+    ((snapshot)) && printf ' %s\n' "$snapshot_note"
+    if ((show)) && [[ -s $diffs ]]; then hdr "Diffs"; cat "$diffs"; fi
+  fi
+  ((snapshot_failed && exitcode)) && return 4
   ((SIM_FAILED)) && return 5
   ((exitcode && n_cust + n_your > 0)) && return 3
   return 0
@@ -1338,7 +1604,7 @@ package_edits() {
   [[ -n $out ]] || return 0
   hdr "Package files you edited by hand"
   say " The update replaces these with the new package's copy (files in /etc get a .pacnew instead):"
-  sed 's/^/   /' <<<"$out"
+  printf '   %s\n' "${out//$'\n'/$'\n   '}"
   say " ${D}Move those edits into ~/.config, where Omarchy expects overrides.${N}"
 }
 
@@ -1394,8 +1660,8 @@ cmd_report() {
     say " Undo all:       $PROG restore $id"
     say " Undo one file:  $PROG restore $id ~/<path>"
   fi
-  [[ -n $baks ]] && { say ""; say " Omarchy saved these backups during the update:"; sed "s#^$HOME#   ~#" <<<"$baks"; }
-  [[ -n $pacnew ]] && { say ""; say " New .pacnew/.pacsave files to review (sudo pacdiff):"; sed 's/^/   /' <<<"$pacnew"; }
+  [[ -n $baks ]] && { say ""; say " Omarchy saved these backups during the update:"; while IFS= read -r bak; do printf '   %s\n' "$(tilde "$bak")"; done <<<"$baks"; }
+  [[ -n $pacnew ]] && { say ""; say " New .pacnew/.pacsave files to review (sudo pacdiff):"; printf '   %s\n' "${pacnew//$'\n'/$'\n   '}"; }
   if ((notify)) && [[ -s $tmp/ch ]] && have notify-send; then
     notify-send -a omaforecast "Update changed $(wc -l <"$tmp/ch") config file(s)" "Run '$PROG restore' to undo." 2>/dev/null || true
   fi
@@ -1432,6 +1698,65 @@ HOOK_FILE=$HOME/.config/omarchy/hooks/post-update.d/50-omaforecast
 MENU_FILE=$HOME/.config/omarchy/extensions/omarchy-menu.jsonc
 PAC_HOOK=/etc/pacman.d/hooks/90-omaforecast-snapshot.hook
 SYS_DIR=/usr/local/lib/omaforecast
+
+cmd_self_update() {
+  local check=0 force=0
+  while (($#)); do
+    case $1 in
+      --check) check=1 ;; -f | --force) force=1 ;; -y | --yes) ASSUME_YES=1 ;;
+      *) die "self-update: unknown option $1" ;;
+    esac
+    shift
+  done
+  local dir=${SELF%/*} repo=${OMAFORECAST_REPO:-w-mir1/omaforecast} ref=${OMAFORECAST_REF:-main}
+  [[ ! -e $dir/../.git ]] || die "running from a git checkout ($SELF); update it with git pull"
+  if [[ $SELF == "$SYS_DIR" || $SELF == "$SYS_DIR"/* ]]; then
+    if [[ -e $HOME/.local/bin/omaforecast ]]; then die "the pacman hook uses its own copy; run $HOME/.local/bin/omaforecast self-update instead"
+    else die "the pacman hook uses its own copy; rerun the omaforecast installer"; fi
+  fi
+  [[ -w $dir && -w $SELF ]] || die "can't write $SELF; it wasn't installed by the omaforecast installer. Reinstall with: curl -fsSL https://raw.githubusercontent.com/$repo/main/install.sh | bash"
+  have curl || die "self-update needs curl"
+  local url tmp first new
+  url=$(self_update_url) || die "OMAFORECAST_RAW_BASE must use file://, http:// or https://"
+  tmp=$(mktemp) || die "can't create a download file"
+  TMPS+=("$tmp")
+  curl -fsSL --connect-timeout 5 --max-time 30 "$url" -o "$tmp" || die "could not download $url"
+  IFS= read -r first <"$tmp"
+  if [[ $first != '#!/bin/bash' ]] || ! bash -n "$tmp" || ! grep -qx 'PROG=omaforecast' "$tmp"; then
+    die "invalid omaforecast download"
+  fi
+  new=$(LC_ALL=C sed -n '/^VERSION=[0-9][0-9A-Za-z.+-]*$/s/^VERSION=//p' "$tmp")
+  [[ -n $new && $new != *$'\n'* ]] || die "invalid omaforecast download: missing or ambiguous VERSION"
+  if [[ $new == "$VERSION" ]]; then
+    if ((check || !force)); then say "omaforecast $VERSION is already the latest ($ref)."; return 0; fi
+  elif newer_version "$new" "$VERSION"; then
+    if ((check)); then say "omaforecast $new is available (you have $VERSION)."; return 10; fi
+  else
+    say "omaforecast $new ($ref) is older than your $VERSION."
+    ((check)) && return 0
+    ((force)) || die "refusing to downgrade; pass --force to install it anyway"
+  fi
+  confirm "Install omaforecast $new ($ref)?" || { say "Self-update cancelled."; return 1; }
+  local setup_args=()
+  [[ -e $HOOK_FILE ]] || setup_args+=(--no-hook)
+  if grep -q '>>> omaforecast' "$MENU_FILE" 2>/dev/null; then
+    if sed -n '/>>> omaforecast/,/<<< omaforecast/p' "$MENU_FILE" | grep -q '"update.omarchy"'; then setup_args+=(--menu-update); fi
+  else setup_args+=(--no-menu); fi
+  if [[ -e $PAC_HOOK || -e $SYS_DIR ]]; then
+    say "The pacman hook uses its own copy in /usr/local/lib/omaforecast; refresh it with: omaforecast setup --pacman-hook"
+  fi
+  local next=$SELF.new.$$
+  TMPS+=("$next")
+  install -m755 -- "$tmp" "$next" || die "can't install $next"
+  # Finish in a new bash process immediately after the atomic replacement.
+  # Cleanup first: exec does not run the EXIT trap.
+  rm -f -- "$tmp"
+  mv -f -- "$next" "$SELF" || die "can't replace $SELF"
+  printf '%s✓ omaforecast %s → %s%s\n' "$G" "$VERSION" "$new" "$N"
+  cache_latest_version "$new" || warn "couldn't refresh the latest-version cache"
+  export OMAFORECAST_NO_UPDATE_CHECK=1
+  exec "$SELF" setup "${setup_args[@]}"
+}
 
 menu_block() {
   local upd=$1
@@ -1548,10 +1873,14 @@ ${B}omaforecast $VERSION${N}: see what the next Omarchy update will do to your c
 ${B}Usage:${N} $PROG <command> [options]
 
   ${B}check${N}            Dry-run the incoming update's migrations against a sandboxed copy
-                   of your config, list every file they'd change, and snapshot first.
+                   of your config, summarize risks, save a full report, and snapshot first.
                    --diff  show the diffs   --offline  don't fetch   --from PATH  use a
                    package file / extracted tree / checkout   --no-snapshot   --exit-code
+                   --verbose / --full / -v  full details   --quiet  report only
+                   --no-sim  static mentions only
   ${B}update${N} [-y]      check, ask if your customized files are affected, then run omarchy update
+  ${B}self-update${N} [--check]   Update omaforecast itself to the latest version
+                   --force  reinstall or downgrade   --yes  skip confirmation
   ${B}restore${N} [SNAP] [PATH...]
                    Put files back from a snapshot (default: the last pre-update one).
                    Saves a pre-restore snapshot first, so a restore is undoable.
@@ -1568,15 +1897,26 @@ ${B}Usage:${N} $PROG <command> [options]
 
 Snapshots: $(tilde "$SNAPDIR")   Scope: Omarchy's shipped ~/.config files + extras;
 add paths to $(tilde "$OF_CONF/include"), globs to $(tilde "$OF_CONF/exclude").
+Reports: $(tilde "$OF_STATE/reports")/omarchy_update_details_<YYMMDD>_<HH>_<MM>_UTC.md
+Latest copy: $(tilde "$OF_STATE/last-forecast.md")
+Set OMAFORECAST_PROGRESS=0 to disable progress on stderr.
+Set OMAFORECAST_NO_UPDATE_CHECK=1 to disable update notices.
 USAGE
 }
 
 main() {
+  update_notice "$@"
   local cmd=${1:-help}
   (($#)) && shift
   case $cmd in
     check | forecast | preview) cmd_check "$@" ;;
-    update | up) cmd_update "$@" ;;
+    self-update | upgrade) cmd_self_update "$@" ;;
+    update | up)
+      local arg self=0 args=()
+      for arg in "$@"; do
+        if [[ $arg == --self ]]; then self=1; else args+=("$arg"); fi
+      done
+      if ((self)); then cmd_self_update "${args[@]}"; else cmd_update "$@"; fi ;;
     restore | rollback | undo) cmd_restore "$@" ;;
     diff) cmd_diff "$@" ;;
     report) cmd_report "$@" ;;
