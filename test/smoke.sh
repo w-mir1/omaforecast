@@ -41,8 +41,8 @@ fails=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
 
 check "help prints usage" '"$bin" help | grep -q "omaforecast 0"'
-check "version is 0.2.0" '[[ $("$bin" --version) == "omaforecast 0.2.0" ]]'
-check "released changelog starts at 0.2.0" '[[ $(sed -n "/^## \[/{p;q;}" "$here/../CHANGELOG.md") == "## [0.2.0]"* ]]'
+check "version is 0.2.1" '[[ $("$bin" --version) == "omaforecast 0.2.1" ]]'
+check "released changelog starts at 0.2.1" '[[ $(sed -n "/^## \[/{p;q;}" "$here/../CHANGELOG.md") == "## [0.2.1]"* ]]'
 # ---- self-update and asynchronous notices (file:// fixtures only) ----
 update_home=$t/update-home
 OF_CACHE=$update_home/.cache/omaforecast
@@ -66,31 +66,31 @@ poll_file() {
   return 1
 }
 notice_is() {
-  printf 'omaforecast %s is available (you have 0.2.0). Run: omaforecast self-update\n' "$1" >"$t/notice.expected"
+  printf 'omaforecast %s is available (you have 0.2.1). Run: omaforecast self-update\n' "$1" >"$t/notice.expected"
   cmp -s "$t/notice.expected" "$t/notice.err" && ! grep -q 'is available' "$t/notice.out"
 }
 no_notice() {
   ! grep -q 'is available' "$t/notice.err" &&
     ! grep -q 'is available.*Run: omaforecast self-update' "$t/notice.out"
 }
-update_fixture 0.2.1
+update_fixture 0.2.2
 if (($(id -u) != 0)); then
   update_run "$installed" help >"$t/notice.out" 2>"$t/notice.err"; rc=$?
   check "update notice: empty cache prints no notice" '((rc == 0)) && [[ ! -s $t/notice.err ]] && no_notice'
-  check "update notice: first help fetches the fixture in the background" 'poll_file "$OF_CACHE/latest-version" 0.2.1'
+  check "update notice: first help fetches the fixture in the background" 'poll_file "$OF_CACHE/latest-version" 0.2.2'
   update_run "$installed" help >"$t/notice.out" 2>"$t/notice.err"; rc=$?
-  check "update notice: second help prints exactly one stderr line, none on stdout" '((rc == 0)) && notice_is 0.2.1'
+  check "update notice: second help prints exactly one stderr line, none on stdout" '((rc == 0)) && notice_is 0.2.2'
 
-  update_fixture 0.2.2
+  update_fixture 0.2.3
   cache_mtime=$(stat -c %y "$OF_CACHE/latest-version")
   update_run "$installed" help >"$t/notice.out" 2>"$t/notice.err"
   sleep 1
-  check "update notice: fresh cache keeps old version and mtime after one second" 'notice_is 0.2.1 && grep -qx 0.2.1 "$OF_CACHE/latest-version" && [[ $(stat -c %y "$OF_CACHE/latest-version") == "$cache_mtime" ]]'
+  check "update notice: fresh cache keeps old version and mtime after one second" 'notice_is 0.2.2 && grep -qx 0.2.2 "$OF_CACHE/latest-version" && [[ $(stat -c %y "$OF_CACHE/latest-version") == "$cache_mtime" ]]'
   update_run env OMAFORECAST_UPDATE_CHECK_INTERVAL=0 "$installed" help >"$t/notice.out" 2>"$t/notice.err"
-  check "update notice: interval zero still prints the previously cached version" 'notice_is 0.2.1'
-  check "update notice: interval zero refreshes the cache" 'poll_file "$OF_CACHE/latest-version" 0.2.2'
+  check "update notice: interval zero still prints the previously cached version" 'notice_is 0.2.2'
+  check "update notice: interval zero refreshes the cache" 'poll_file "$OF_CACHE/latest-version" 0.2.3'
   update_run "$installed" help >"$t/notice.out" 2>"$t/notice.err"
-  check "update notice: next help prints the refreshed version" 'notice_is 0.2.2'
+  check "update notice: next help prints the refreshed version" 'notice_is 0.2.3'
 
   # A stale cache makes accidental fetching observable even for silent commands.
   touch -d '@1' "$OF_CACHE/latest-version"
@@ -111,10 +111,10 @@ if (($(id -u) != 0)); then
     update_run "$installed" "${args[@]}" >"$t/notice.out" 2>"$t/notice.err"; rc=$?
     check "update notice: $silent is silent" '((rc == expected_rc)) && no_notice'
   done
-  check "update notice: suppressed commands leave stale cache untouched" 'grep -qx 0.2.2 "$OF_CACHE/latest-version" && [[ $(stat -c %y "$OF_CACHE/latest-version") == "$cache_mtime" ]]'
+  check "update notice: suppressed commands leave stale cache untouched" 'grep -qx 0.2.3 "$OF_CACHE/latest-version" && [[ $(stat -c %y "$OF_CACHE/latest-version") == "$cache_mtime" ]]'
   update_run env -u OMAFORECAST_UPDATE_CHECK_FORCE_TTY "$installed" help >"$t/notice.out" 2>"$t/notice.err"; rc=$?
   sleep 1
-  check "update notice: redirected stderr without FORCE_TTY is silent and spawns no fetch" '((rc == 0)) && no_notice && grep -qx 0.2.2 "$OF_CACHE/latest-version" && [[ $(stat -c %y "$OF_CACHE/latest-version") == "$cache_mtime" ]]'
+  check "update notice: redirected stderr without FORCE_TTY is silent and spawns no fetch" '((rc == 0)) && no_notice && grep -qx 0.2.3 "$OF_CACHE/latest-version" && [[ $(stat -c %y "$OF_CACHE/latest-version") == "$cache_mtime" ]]'
 
   # HTTP is blocked above. A missing file URL plus a ten-second fake curl
   # exercises an unreachable source without any socket or real network access.
@@ -131,7 +131,7 @@ SLOW_CURL
     SMOKE_SLOW_ARGS="$t/slow.args" SMOKE_SLOW_PID="$t/slow.pid" \
     "$installed" help >"$t/notice.out" 2>"$t/notice.err"; rc=$?
   elapsed=$(( $(date +%s%N) - started ))
-  check "update notice: unreachable slow curl leaves foreground help under two seconds" '((rc == 0 && elapsed < 2000000000)) && notice_is 0.2.2'
+  check "update notice: unreachable slow curl leaves foreground help under two seconds" '((rc == 0 && elapsed < 2000000000)) && notice_is 0.2.3'
   # Confirm the slow fetch actually started; stop its sleep before fixture cleanup.
   slow_deadline=$((SECONDS + 5))
   while [[ ! -s $t/slow.pid ]] && ((SECONDS < slow_deadline)); do sleep 0.05; done
@@ -140,13 +140,13 @@ SLOW_CURL
   [[ -z $slow_pid ]] || kill "$slow_pid" 2>/dev/null
 else
   echo "skip update notice checks (notices disabled for root)"
-  update_fixture 0.2.2
+  update_fixture 0.2.3
 fi
 
 # Self-update checks run against a disposable installed copy, never the checkout.
 cp "$installed" "$t/installed.before"
 update_run "$installed" self-update --check >"$t/update.out" 2>"$t/update.err"; rc=$?
-check "self-update check compares against 0.2.0 without replacement" '((rc == 10)) && grep -q "0.2.2 is available (you have 0.2.0)" "$t/update.out" && cmp -s "$t/installed.before" "$installed"'
+check "self-update check compares against 0.2.1 without replacement" '((rc == 10)) && grep -q "0.2.3 is available (you have 0.2.1)" "$t/update.out" && cmp -s "$t/installed.before" "$installed"'
 update_run "$installed" update --self --check >"$t/update-alias.out" 2>"$t/update-alias.err"; rc=$?
 check "self-update: update --self --check has identical output and exit 10" '((rc == 10)) && cmp -s "$t/update.out" "$t/update-alias.out" && cmp -s "$t/update.err" "$t/update-alias.err" && cmp -s "$t/installed.before" "$installed"'
 update_run "$installed" setup >/dev/null
@@ -154,9 +154,9 @@ update_menu=$update_home/.config/omarchy/extensions/omarchy-menu.jsonc
 update_hook=$update_home/.config/omarchy/hooks/post-update.d/50-omaforecast
 check "self-update: hook and menu are present before updating" '[[ -x $update_hook ]] && grep -q ">>> omaforecast" "$update_menu"'
 update_run "$installed" self-update --yes >"$t/update.out" 2>"$t/update.err"; rc=$?
-check "self-update replaces installed copy and prints 0.2.0 → 0.2.2" '((rc == 0)) && [[ $("$installed" --version) == "omaforecast 0.2.2" ]] && grep -qF "0.2.0 → 0.2.2" "$t/update.out"'
+check "self-update replaces installed copy and prints 0.2.1 → 0.2.3" '((rc == 0)) && [[ $("$installed" --version) == "omaforecast 0.2.3" ]] && grep -qF "0.2.1 → 0.2.3" "$t/update.out"'
 check "self-update: hook and menu remain present" '[[ -x $update_hook ]] && grep -q ">>> omaforecast" "$update_menu"'
-check "self-update: cache records installed version and update output has no notice" 'grep -qx 0.2.2 "$OF_CACHE/latest-version" && ! grep -q "is available" "$t/update.out" "$t/update.err"'
+check "self-update: cache records installed version and update output has no notice" 'grep -qx 0.2.3 "$OF_CACHE/latest-version" && ! grep -q "is available" "$t/update.out" "$t/update.err"'
 update_run "$installed" help >"$t/notice.out" 2>"$t/notice.err"
 check "self-update: subsequent help has no notice" '[[ ! -s $t/notice.err ]] && no_notice'
 
@@ -168,7 +168,7 @@ update_run "$installed" self-update --force --yes >"$t/update.out" 2>"$t/update.
 check "self-update: forced reinstall keeps menu absent and hook present" '((rc == 0)) && ! grep -q ">>> omaforecast" "$update_menu" && [[ -x $update_hook ]]'
 update_run "$installed" setup --menu-update >/dev/null
 check "self-update: update.omarchy row is present before updating" 'grep -q "\"update.omarchy\"" "$update_menu"'
-update_fixture 0.2.3
+update_fixture 0.2.4
 update_run "$installed" self-update --yes >"$t/update.out" 2>"$t/update.err"; rc=$?
 check "self-update: update.omarchy row survives updating" '((rc == 0)) && grep -q "\"update.omarchy\"" "$update_menu" && [[ -x $update_hook ]]'
 
@@ -179,7 +179,7 @@ check "self-update: downgrade refusal leaves installed bytes identical" '((rc !=
 update_run "$installed" self-update --force --yes >"$t/update.out" 2>"$t/update.err"; rc=$?
 check "self-update: --force installs an older fixture" '((rc == 0)) && [[ $("$installed" --version) == "omaforecast 0.1.9" ]] && cmp -s "$fixture" "$installed"'
 cp "$installed" "$t/installed.before"
-update_fixture 0.2.4
+update_fixture 0.2.5
 printf '\nif then\n' >>"$fixture"
 update_run "$installed" self-update --yes >"$t/update.out" 2>"$t/update.err"; rc=$?
 check "self-update: syntax-error refusal leaves installed bytes identical" '((rc != 0)) && grep -q "invalid omaforecast download" "$t/update.err" && cmp -s "$t/installed.before" "$installed"'
@@ -189,7 +189,7 @@ check "self-update: missing-VERSION refusal leaves installed bytes identical" '(
 printf 'invalid download\n' >"$fixture"
 update_run "$installed" self-update --yes >"$t/update.out" 2>"$t/update.err"; rc=$?
 check "self-update rejects invalid downloads without replacement" '((rc != 0)) && cmp -s "$t/installed.before" "$installed"'
-update_fixture 0.2.4
+update_fixture 0.2.5
 if (($(id -u) != 0)); then
   chmod a-w "${installed%/*}"
   update_run "$installed" self-update --yes >"$t/update.out" 2>"$t/update.err"; rc=$?
@@ -415,11 +415,13 @@ echo 'echo "x"' >"$t/linktree/migrations/1700000001.sh"
 check "an incoming tree with bin/ linking outside it is refused" '((rc != 0)) && grep -q "links outside itself" "$t/lt.out"'
 
 # H6: state, snapshots, and forecast output are private.
-mkdir -p "$t/tree/migrations"; echo 'echo "Touch kitty"' >"$t/tree/migrations/1700000000.sh"
-OMAFORECAST_NO_SANDBOX=1 "$bin" check --offline --no-snapshot --from "$t/tree" >/dev/null 2>&1
+mkdir -p "$t/tree/migrations" "$t/tree/config/hypr"; echo 'echo "Touch kitty"' >"$t/tree/migrations/1700000000.sh"
+echo 'new default' >"$t/tree/config/hypr/bindings.lua"
+OMAFORECAST_NOW_UTC=261019_12_00 OMAFORECAST_NO_SANDBOX=1 "$bin" check --offline --no-snapshot --from "$t/tree" >/dev/null 2>&1
+h6_diff=$HOME/.local/state/omaforecast/reports/omarchy_update_details_261019_12_00_UTC.diff
 check "H6 state dir is 700" '[[ $(stat -c %a "$HOME/.local/state/omaforecast") == 700 ]]'
 check "H6 snapshot dirs are private" '[[ $(stat -c %a "$S/$id6") == 700 ]]'
-check "H6 forecast diff is 600" '[[ $(stat -c %a "$HOME/.local/state/omaforecast/last-forecast.diff") == 600 ]]'
+check "H6 forecast diff is 600" '[[ -s $h6_diff && $(stat -c %a "$h6_diff") == 600 ]]'
 check "H6 saved files keep their own mode" '[[ $(stat -c %a "$S/$id6/files/.config/hypr/bindings.lua") == 644 ]] || [[ $(stat -c %a "$S/$id6/files/.config/hypr/bindings.lua") == $(stat -c %a "$t/dots/hypr/bindings.lua") ]]'
 
 # A sandbox that can't be created is an error, never an empty forecast.
@@ -486,7 +488,7 @@ check "uninstall keeps the user's own menu rows" 'grep -q personal "$HOME/.confi
 check "uninstall leaves the repo script alone" '[[ -x $bin ]]'
 
 # ---- short forecasts, reports and stderr progress (no network) ----
-check "README names release 0.2.0" 'grep -q "0.2.0" "$here/../README.md"'
+check "README names release 0.2.1" 'grep -q "0.2.1" "$here/../README.md"'
 mkdir -p "$t/new/migrations" "$t/new/config/hypr" "$t/report-stock/config/hypr" "$t/report-home/.config/hypr" "$t/report-markers"
 printf 'stock\n' >"$t/report-stock/config/hypr/bindings.lua"
 printf 'stock\n' >"$t/report-stock/config/hypr/stock.lua"
@@ -571,8 +573,14 @@ forecast() {
 }
 state=$t/report-home/.local/state/omaforecast
 reports=$state/reports
+mkdir -p "$state"
+echo 'stale diff from 0.2.0' >"$state/last-forecast.diff"
 OMAFORECAST_NOW_UTC=261019_14_04 forecast "$t/render-check" >"$t/short.out" 2>"$t/short.err"; rc=$?
 report=$reports/omarchy_update_details_261019_14_04_UTC.md
+diff_path=${report%.md}.diff
+check "dated diff pairs with the report, is private and contains migrations and defaults" '[[ -s $diff_path && ! -L $diff_path && $(stat -c %a "$diff_path") == 600 ]] && grep -q "1789325478" "$diff_path" && grep -q "new default: config/hypr/bindings.lua" "$diff_path"'
+check "report and terminal link to the dated diff via tilde" 'grep -qxF "Full diff: ~/.local/state/omaforecast/reports/${diff_path##*/}" "$report" && grep -qxF " Full diff:   omaforecast check --diff  (saved to ~/.local/state/omaforecast/reports/${diff_path##*/})" "$t/short.out"'
+check "check removes the stale fixed diff without a symlink" '[[ ! -e $state/last-forecast.diff && ! -L $state/last-forecast.diff ]]'
 check "renderer produces the short count line" '((rc == 0)) && grep -q "7 migrations: 1 change your files · 1 stock · 1 create new files · 3 no changes · 1 dry run didn.t finish" "$t/short.out"'
 check "short view lists customized, failed and sudo migrations only" 'grep -q "✗ 1789325478" "$t/short.out" && grep -q "? 1789325482" "$t/short.out" && grep -q "! 1789325484.*runs sudo" "$t/short.out" && ! grep -qE "1789325479|1789325480|1789325481|1789325483" "$t/short.out"'
 check "short attention lines fit 110 columns" '(while IFS= read -r line; do [[ $line != "  "[✗?!]* ]] || ((${#line} <= 110)) || exit 1; done <"$t/short.out")'
@@ -585,6 +593,8 @@ check "reports and last copy have private modes" '[[ $(stat -c %a "$reports") ==
 check "no forced progress on redirected stderr; stdout has no CR" '[[ ! -s $t/short.err ]] && ! grep -q "$(printf "\r")" "$t/short.out"'
 OMAFORECAST_NOW_UTC=261019_14_04 forecast "$bin" --no-sim --quiet >"$t/quiet.out" 2>"$t/quiet.err"; rc=$?
 check "same-minute reports get _2 without clobbering" '((rc == 0)) && [[ -f $reports/omarchy_update_details_261019_14_04_UTC_2.md ]] && grep -q "Changes your files" "$report"'
+check "same-minute diff gets _2 paired with its report without clobbering" '[[ -s $reports/omarchy_update_details_261019_14_04_UTC_2.diff ]] && grep -qxF "Full diff: ~/.local/state/omaforecast/reports/omarchy_update_details_261019_14_04_UTC_2.diff" "$reports/omarchy_update_details_261019_14_04_UTC_2.md" && grep -q "1789325478" "$diff_path"'
+check "a second check does not create a fixed diff" '[[ ! -e $state/last-forecast.diff && ! -L $state/last-forecast.diff ]]'
 check "quiet writes a report with no terminal output" '[[ ! -s $t/quiet.out && ! -s $t/quiet.err ]] && grep -q "Not simulated" "$state/last-forecast.md"'
 forecast "$t/render-check" --verbose --diff >"$t/verbose.out" 2>"$t/verbose.err"
 check "verbose restores per-migration lines and --diff appends diffs" 'grep -q "✓ 1789325481" "$t/verbose.out" && grep -q "would modify ~/.config/hypr/stock.lua" "$t/verbose.out" && grep -q "^Diffs" "$t/verbose.out" && grep -q "^--- a/" "$t/verbose.out"'
@@ -609,17 +619,29 @@ OMAFORECAST_NOW_UTC=261019_15_00 forecast "$bin" --no-sim --quiet & p1=$!
 OMAFORECAST_NOW_UTC=261019_15_00 forecast "$bin" --no-sim --quiet & p2=$!
 wait "$p1"; rc1=$?; wait "$p2"; rc2=$?
 check "concurrent checks atomically reserve two complete distinct reports" '((rc1 == 0 && rc2 == 0)) && [[ -f $reports/omarchy_update_details_261019_15_00_UTC.md && -f $reports/omarchy_update_details_261019_15_00_UTC_2.md ]] && grep -q "^## Summary" "$reports/omarchy_update_details_261019_15_00_UTC.md" && grep -q "^## Summary" "$reports/omarchy_update_details_261019_15_00_UTC_2.md"'
+check "concurrent checks save separate paired diffs" '[[ -s $reports/omarchy_update_details_261019_15_00_UTC.diff && -s $reports/omarchy_update_details_261019_15_00_UTC_2.diff ]] && grep -qxF "Full diff: ~/.local/state/omaforecast/reports/omarchy_update_details_261019_15_00_UTC.diff" "$reports/omarchy_update_details_261019_15_00_UTC.md" && grep -qxF "Full diff: ~/.local/state/omaforecast/reports/omarchy_update_details_261019_15_00_UTC_2.diff" "$reports/omarchy_update_details_261019_15_00_UTC_2.md"'
+# A diff left without a report must survive, and both new paths advance together.
+orphan=$reports/omarchy_update_details_261019_15_02_UTC.diff
+echo 'orphaned diff' >"$orphan"
+OMAFORECAST_NOW_UTC=261019_15_02 forecast "$bin" --no-sim >"$t/collision.out" 2>"$t/collision.err"; rc=$?
+check "an existing paired diff advances both names and reports the actual path" '((rc == 0)) && grep -qx "orphaned diff" "$orphan" && [[ ! -e ${orphan%.diff}.md && -s ${orphan%.diff}_2.diff && -s ${orphan%.diff}_2.md ]] && grep -qxF "Full diff: ~/.local/state/omaforecast/reports/omarchy_update_details_261019_15_02_UTC_2.diff" "${orphan%.diff}_2.md" && grep -qF "(saved to ~/.local/state/omaforecast/reports/omarchy_update_details_261019_15_02_UTC_2.diff)" "$t/collision.out"'
 # Force a later filename clock after fetch: the check must retain start time.
 HOME=$t/report-home OMARCHY_PATH=$t/report-stock OMAFORECAST_NOW_UTC=261019_15_01 OMAFORECAST_SOURCED=1 bash -c '
   . "$1"; fetch_incoming() { NEW_SHARE=$SMOKE_NEW_TREE; NEW_DESC=fixture; OMAFORECAST_NOW_UTC=261019_23_59; }; cmd_check --no-sim --no-snapshot --quiet
 ' _ "$bin" "$t/new"
 check "filename retains the UTC time captured before fetch" '[[ -f $reports/omarchy_update_details_261019_15_01_UTC.md && ! -f $reports/omarchy_update_details_261019_23_59_UTC.md ]]'
 : >"$reports/unrelated.md"
+: >"$reports/unrelated.diff"
+# Age this known pair so pruning is deterministic even on coarse clocks.
+touch -d '@1' "$report"
 OMAFORECAST_KEEP_REPORTS=2 forecast "$bin" --no-sim --quiet
 check "pruning retains only newest configured reports and leaves unrelated files" '[[ $(find "$reports" -name "omarchy_update_details_*_UTC*.md" | wc -l) == 2 && -f $reports/unrelated.md ]]'
+check "pruning removes paired diffs and preserves unrelated and orphaned diffs" '[[ ! -e $report && ! -e $diff_path && -f $reports/unrelated.diff ]] && grep -qx "orphaned diff" "$orphan" && [[ $(find "$reports" -name "omarchy_update_details_*_UTC*.diff" | wc -l) == 3 ]]'
 mkdir -p "$t/empty/migrations"
-HOME=$t/report-home OMARCHY_PATH=$t/report-stock "$bin" check --from "$t/empty" --no-snapshot >"$t/empty.out" 2>"$t/empty.err"
+HOME=$t/report-home OMARCHY_PATH=$t/report-stock OMAFORECAST_NOW_UTC=261019_16_00 "$bin" check --from "$t/empty" --no-snapshot >"$t/empty.out" 2>"$t/empty.err"
 check "no pending migrations still creates a tiny complete report" 'grep -q "No pending migrations" "$t/empty.out" && grep -q "Pending migrations: 0" "$state/last-forecast.md" && grep -q "^## Summary" "$state/last-forecast.md"'
+empty_report=$reports/omarchy_update_details_261019_16_00_UTC.md
+check "no collected diff omits both links and creates no diff or fixed file" '[[ -s $empty_report && ! -e ${empty_report%.md}.diff && ! -e $state/last-forecast.diff && ! -L $state/last-forecast.diff ]] && ! grep -q "Full diff:" "$state/last-forecast.md" "$t/empty.out"'
 
 # Unit coverage of ETA formatting, ASCII fallback, and cleanup on termination.
 OMAFORECAST_SOURCED=1 bash -c '

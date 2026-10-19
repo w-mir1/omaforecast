@@ -31,7 +31,7 @@ omaforecast does three things:
 - **Snapshot.** It saves your Omarchy config before every update.
 - **Rollback.** `omaforecast restore` puts back everything the update changed, or one file. It saves a snapshot first, so you can undo the restore too.
 
-Current release: **0.2.0**. It is one bash script. It needs no root, and the dry run uses bubblewrap.
+Current release: **0.2.1**. It is one bash script. It needs no root, and the dry run uses bubblewrap.
 
 ## Install
 
@@ -83,12 +83,12 @@ Pending migrations: 6 (they run as you, right after the packages install)
 Summary
  2 file(s) you changed would be rewritten. Also: 0 stock, 1 new.
  Full report: ~/.local/state/omaforecast/reports/omarchy_update_details_261019_14_04_UTC.md
- Full diff:   omaforecast check --diff  (saved to ~/.local/state/omaforecast/last-forecast.diff)
+ Full diff:   omaforecast check --diff  (saved to ~/.local/state/omaforecast/reports/omarchy_update_details_261019_14_04_UTC.diff)
  Snapshot saved: 20261019-140500-pre-update
  After the update, undo it with: omaforecast restore  (or one file: omaforecast restore <path>)
 ```
 
-The default view summarizes migrations and shows an attention line for migrations that change your files, fail, or request `sudo`/`pkexec`. Every check, including `--no-sim`, `--quiet`, and checks with no pending migrations, saves full Markdown details in `~/.local/state/omaforecast/reports/omarchy_update_details_<YYMMDD>_<HH>_<MM>_UTC.md`. The timestamp is UTC when the check started. Runs in the same minute get `_2`, `_3`, etc.; concurrent runs reserve distinct names. `~/.local/state/omaforecast/last-forecast.md` is an atomic copy of the latest completed report. Reports are private (directory 700, files 600); the newest 20 are kept (`OMAFORECAST_KEEP_REPORTS` changes this).
+The default view summarizes migrations and shows an attention line for migrations that change your files, fail, or request `sudo`/`pkexec`. Every check, including `--no-sim`, `--quiet`, and checks with no pending migrations, saves full Markdown details in `~/.local/state/omaforecast/reports/omarchy_update_details_<YYMMDD>_<HH>_<MM>_UTC.md`. The timestamp is UTC when the check started. Runs in the same minute get `_2`, `_3`, etc.; concurrent runs reserve distinct names. Non-empty full diffs are saved next to their reports with the same stem and a `.diff` extension (including any collision suffix). `~/.local/state/omaforecast/last-forecast.md` is an atomic copy of the latest completed report. Reports and diffs are private (directory 700, files 600); the newest 20 reports and their paired diffs are kept (`OMAFORECAST_KEEP_REPORTS` changes this).
 
 Use `omaforecast check --verbose` (also `--full` or `-v`) for the full per-migration terminal view, `--diff` to append diffs, or `--quiet` to write the report without terminal output except errors. Progress animates on stderr when it is a terminal, even with piped stdout. `OMAFORECAST_PROGRESS=0` disables it; `=1` forces it. After two migrations an estimated time remaining appears.
 

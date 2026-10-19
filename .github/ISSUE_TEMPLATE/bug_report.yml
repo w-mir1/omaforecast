@@ -13,7 +13,7 @@ body:
     id: output
     attributes:
       label: Output
-      description: Paste the output of the command. For a wrong forecast, also attach ~/.local/state/omaforecast/last-forecast.diff and any logs in ~/.local/state/omaforecast/sim-logs/.
+      description: Paste the output of the command. For a wrong forecast, also attach the matching ~/.local/state/omaforecast/reports/omarchy_update_details_*_UTC*.diff and any logs in ~/.local/state/omaforecast/sim-logs/.
       render: text
   - type: input
     id: versions

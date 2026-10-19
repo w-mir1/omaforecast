@@ -25,7 +25,20 @@ pkgdesc="Omarchy test fixture ($name)"
 arch=(any)
 license=(MIT)
 options=(!strip !debug)
-package() { cp -a $FX/$name/. "\$pkgdir/"; }
+package() {
+  cp -a $FX/$name/. "\$pkgdir/"
+  # Demo pacing only: slow v2 migrations inside the dry-run sandbox.
+  if [[ "$name" == v2 && "${MODE:-}" == demo ]]; then
+    local migration pacing='[[ -z \${OMAFORECAST_SIM:-} ]] || sleep 1.2  # demo pacing: real migrations take seconds'
+    for migration in "\$pkgdir"/usr/share/omarchy/migrations/*.sh; do
+      if [[ \$(head -c 2 "\$migration") == '#!' ]]; then
+        sed -i "1a \$pacing" "\$migration"
+      else
+        sed -i "1i \$pacing" "\$migration"
+      fi
+    done
+  fi
+}
 PKG
   chown -R builder /build/$name
   runuser -u builder -- bash -c "cd /build/$name && PKGEXT=.pkg.tar makepkg -f >/tmp/makepkg-$name.log 2>&1" || { tail /tmp/makepkg-$name.log; exit 1; }
@@ -137,14 +150,14 @@ if [[ ${MODE:-} == demo ]]; then
   step "Record demo"
   pacman -S --noconfirm --needed asciinema ttf-dejavu >/dev/null 2>&1
   runuser -u dev -- env -C /home/dev HOME=/home/dev USER=dev OMARCHY_PATH=/usr/share/omarchy \
-    asciinema rec --headless --overwrite --window-size 104x46 --idle-time-limit 3 -c /omaforecast/test/demo-session.sh /tmp/omaforecast.cast
+    asciinema rec --headless --overwrite --window-size 104x46 --idle-time-limit 6 -c /omaforecast/test/demo-session.sh /tmp/omaforecast.cast
   cp /tmp/omaforecast.cast /work/omaforecast.cast
   exit $?
 fi
 
 step "omaforecast check (the forecast)"
 as_dev 'COLUMNS=100 omaforecast check' | tee /work/forecast.txt
-as_dev 'cat ~/.local/state/omaforecast/last-forecast.diff' > /work/forecast.diff
+as_dev 'diff=$(find ~/.local/state/omaforecast/reports -maxdepth 1 -type f -name "omarchy_update_details_*_UTC*.diff" -printf "%T@ %p\n" | sort -rn | head -1 | cut -d" " -f2-); cat -- "$diff"' > /work/forecast.diff
 grep -q 'omarchy 4.0.3-1 → 4.0.4-1' /work/forecast.txt && ok "found incoming release from the repo" || bad "incoming release not found"
 grep -q 'Pending migrations: .*6' /work/forecast.txt && ok "6 pending migrations" || bad "pending count"
 grep -q 'kitty/kitty.conf.*customized' /work/forecast.txt && ok "warns: kitty.conf (customized) will change" || bad "kitty warning"
@@ -157,7 +170,8 @@ as_dev 'diff -r /tmp/config-before-update ~/.config -x omarchy-menu.jsonc -x 50-
 pacman -Q omarchy | grep -q 4.0.3 && ok "system packages untouched by forecast" || bad "package changed"
 
 st=/home/dev/.local/state/omaforecast
-[[ $(stat -c %a $st) == 700 && $(stat -c %a $st/snapshots) == 700 && $(stat -c %a $st/last-forecast.diff) == 600 ]] && ! find $st/sim-logs -perm /077 | grep -q . && ok "state, snapshots, diffs and logs are private" || { ls -la $st $st/sim-logs; bad "state permissions"; }
+forecast_diff=$(find "$st/reports" -maxdepth 1 -type f -name 'omarchy_update_details_*_UTC*.diff' -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
+[[ $(stat -c %a $st) == 700 && $(stat -c %a $st/snapshots) == 700 && $(stat -c %a "$forecast_diff") == 600 ]] && ! find $st/sim-logs -perm /077 | grep -q . && ok "state, snapshots, diffs and logs are private" || { ls -la $st $st/sim-logs; bad "state permissions"; }
 
 step "Hostile migration file name (sandboxed dry run)"
 mkdir -p /tmp/evtree/migrations /tmp/evcwd && chmod 777 /tmp/evcwd
@@ -180,7 +194,7 @@ as_dev 'mkdir -p -m700 ~/.ssh && echo SECRET-KEY-MATERIAL > ~/.ssh/id_rsa && chm
 as_dev 'printf "1799999998\\tNETRC-SECRET\\n1799999999\\tNETRC-SECRET\\n" > ~/.netrc-test && chmod 600 ~/.netrc-test'
 as_dev 'echo EXCLUDED-SECRET > ~/.config/hypr/secrets.env && mkdir -p ~/.config/omaforecast ~/.local/state/omarchy/toggles && echo EXCLUDED-SECRET > ~/.local/state/omarchy/toggles/secret.env && printf "%s\n" .config/hypr/secrets.env .local/state/omarchy/toggles/secret.env > ~/.config/omaforecast/exclude'
 as_dev 'omaforecast check --offline --no-snapshot --diff --from /tmp/leaktree' >/work/leak.txt 2>&1
-as_dev 'cat ~/.local/state/omaforecast/last-forecast.diff; cat ~/.local/state/omaforecast/sim-logs/* 2>/dev/null' >>/work/leak.txt
+as_dev 'diff=$(find ~/.local/state/omaforecast/reports -maxdepth 1 -type f -name "omarchy_update_details_*_UTC*.diff" -printf "%T@ %p\n" | sort -rn | head -1 | cut -d" " -f2-); cat -- "$diff"; cat ~/.local/state/omaforecast/sim-logs/* 2>/dev/null' >>/work/leak.txt
 grep -q 'Leak a key' /work/leak.txt && ! grep -qE 'SECRET-KEY-MATERIAL|EXCLUDED-SECRET|OUTSIDE-HOME-SECRET|NETRC-SECRET' /work/leak.txt && ok "private keys, excluded files and files outside home never reach the sandbox" || { cat /work/leak.txt; bad "private file reached the forecast"; }
 as_dev 'rm -rf ~/.netrc-test ~/.ssh ~/.config/omaforecast ~/.config/hypr/secrets.env ~/.local/state/omarchy/toggles/secret.env'
 

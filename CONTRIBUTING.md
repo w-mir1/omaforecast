@@ -4,7 +4,7 @@ Bug reports, wrong forecasts, and pull requests are welcome.
 
 ## Reporting a wrong forecast
 
-A forecast is wrong when `omaforecast check` predicted different file changes than `omaforecast report` showed after the update. Open an issue with the output of both commands, `~/.local/state/omaforecast/last-forecast.diff`, and any logs in `~/.local/state/omaforecast/sim-logs/`. Check those files for anything private before you attach them.
+A forecast is wrong when `omaforecast check` predicted different file changes than `omaforecast report` showed after the update. Open an issue with the output of both commands, the matching `~/.local/state/omaforecast/reports/omarchy_update_details_*_UTC*.diff`, and any logs in `~/.local/state/omaforecast/sim-logs/`. Check those files for anything private before you attach them.
 
 ## Development
 

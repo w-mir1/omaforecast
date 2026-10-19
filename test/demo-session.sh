@@ -13,7 +13,7 @@ pause() { sleep "${1:-2.5}"; }
 clear
 type_cmd "omaforecast check"
 script -qfec "omaforecast check" /dev/null
-pause 6
+pause 8
 clear
 type_cmd "omarchy update        # simulated here: pacman -Syu, then migrations"
 sudo pacman -Syu --noconfirm >/dev/null 2>&1
